@@ -1,0 +1,36 @@
+name: Build chatswipe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install dpkg ldid
+
+      - name: Setup Theos
+        run: |
+          git clone --recurse-submodules https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Download SDK (iPhoneOS16.5)
+        run: |
+          mkdir -p $THEOS/sdks
+          curl -sL https://github.com/theos/sdks/raw/master/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
+          tar -xf /tmp/sdk.tar.xz -C $THEOS/sdks
+
+      - name: Build package
+        run: make package FINALPACKAGE=1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatswipe
+          path: packages/*
