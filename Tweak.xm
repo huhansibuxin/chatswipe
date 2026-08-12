@@ -11,7 +11,7 @@
 static BOOL     gEnabled     = YES;   // 总开关
 static BOOL     gClearEnabled= YES;   // 左滑清空
 static BOOL     gPasteEnabled= YES;   // 右滑粘贴
-static CGFloat  gThreshold   = 60.0;  // 触发所需最小水平位移(pt)
+static CGFloat  gThreshold   = 45.0;  // 触发所需最小水平位移(pt)
 
 static void chatswipe_loadConfig() {
     @try {
