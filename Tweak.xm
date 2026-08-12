@@ -40,6 +40,16 @@ static ChatSwipePanDelegate *gPanDelegate = nil;
 // ==================== 给输入框挂 pan 手势（仅挂一次） ====================
 static void chatswipe_attachIfNeeded(UIView *view) {
     if (!gEnabled || !view) return;
+    // 只给"可编辑"输入区挂手势：跳过只读展示文本框（如消息气泡，横滑会清掉其显示文本）
+    // 与密码框（secureTextEntry），避免误清/误粘敏感内容。
+    if ([view isKindOfClass:[UITextView class]]) {
+        if (!((UITextView *)view).isEditable) return;
+    } else if ([view isKindOfClass:[UITextField class]]) {
+        UITextField *tf = (UITextField *)view;
+        if (tf.secureTextEntry || !tf.enabled) return;
+    } else {
+        return;
+    }
     static const void *kAttached = &kAttached;
     if (objc_getAssociatedObject(view, kAttached)) return;
     objc_setAssociatedObject(view, kAttached, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -56,14 +66,16 @@ static void chatswipe_attachIfNeeded(UIView *view) {
 // ==================== 动作：清空 / 粘贴 ====================
 static void chatswipe_clear(UIView *view) {
     @try {
+        // 统一走 replaceRange：UITextView 会自动触发 textViewDidChange:（勿手调，避免重复触发）；
+        // UITextField 程序化编辑不会自动发 editingChanged，故补一次（且仅一次）。
         if ([view isKindOfClass:[UITextView class]]) {
             UITextView *tv = (UITextView *)view;
-            tv.text = @"";
-            if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)])
-                [tv.delegate textViewDidChange:tv];
+            UITextRange *all = [tv textRangeFromPosition:tv.beginningOfDocument toPosition:tv.endOfDocument];
+            if (all) [tv replaceRange:all withText:@""];
         } else if ([view isKindOfClass:[UITextField class]]) {
             UITextField *tf = (UITextField *)view;
-            tf.text = @"";
+            UITextRange *all = [tf textRangeFromPosition:tf.beginningOfDocument toPosition:tf.endOfDocument];
+            if (all) [tf replaceRange:all withText:@""];
             [tf sendActionsForControlEvents:UIControlEventEditingChanged];
         }
     } @catch (id e) {}
@@ -73,20 +85,19 @@ static void chatswipe_paste(UIView *view) {
     @try {
         NSString *pb = [UIPasteboard generalPasteboard].string;
         if (!pb || pb.length == 0) return;
+        // 统一走 replaceRange：有选区则替换、无选区(或 nil)则插到末尾/光标处。
+        // UITextView 靠 replaceRange 自动触发 textViewDidChange:（勿手调）；
+        // UITextField 程序化编辑不会自动发 editingChanged，故补一次（且仅一次）。
         if ([view isKindOfClass:[UITextView class]]) {
             UITextView *tv = (UITextView *)view;
-            if (tv.selectedTextRange)
-                [tv replaceRange:tv.selectedTextRange withText:pb];
-            else
-                tv.text = [tv.text stringByAppendingString:pb];
-            if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)])
-                [tv.delegate textViewDidChange:tv];
+            UITextRange *r = tv.selectedTextRange
+                ?: [tv textRangeFromPosition:tv.endOfDocument toPosition:tv.endOfDocument];
+            if (r) [tv replaceRange:r withText:pb];
         } else if ([view isKindOfClass:[UITextField class]]) {
             UITextField *tf = (UITextField *)view;
-            if (tf.selectedTextRange)
-                [tf replaceRange:tf.selectedTextRange withText:pb];
-            else
-                tf.text = [tf.text stringByAppendingString:pb];
+            UITextRange *r = tf.selectedTextRange
+                ?: [tf textRangeFromPosition:tf.endOfDocument toPosition:tf.endOfDocument];
+            if (r) [tf replaceRange:r withText:pb];
             [tf sendActionsForControlEvents:UIControlEventEditingChanged];
         }
     } @catch (id e) {}
