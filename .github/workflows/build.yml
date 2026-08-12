@@ -1,9 +1,8 @@
 name: Build chatswipe
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -12,25 +11,63 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Theos
+        run: |
+          git clone --recurse-submodules https://github.com/theos/theos.git ${{ runner.temp }}/theos
+          find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl|' {} \;
+          echo "THEOS=${{ runner.temp }}/theos" >> $GITHUB_ENV
+          echo "THEOS_PACKAGE_SCHEME=rootless" >> $GITHUB_ENV
+
       - name: Install dependencies
         run: brew install dpkg ldid
 
-      - name: Setup Theos
+      - name: Install SDK
         run: |
-          git clone --recurse-submodules https://github.com/theos/theos.git $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          cd ${{ runner.temp }}/theos/sdks
+          curl -sLO https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q master.zip
+          mv sdks-master/iPhoneOS16.5.sdk .
+          rm -rf sdks-master master.zip
 
-      - name: Download SDK (iPhoneOS16.5)
+      - name: Build
         run: |
-          mkdir -p $THEOS/sdks
-          curl -sL https://github.com/theos/sdks/raw/master/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
-          tar -xf /tmp/sdk.tar.xz -C $THEOS/sdks
+          set -o pipefail
+          make package 2>&1 | tee build.log
 
-      - name: Build package
-        run: make package FINALPACKAGE=1
+      - name: Fix dependency install name in staged dylib (-> @executable_path, 与 wctweak 一致)
+        # TrollFools 把 dylib 放进 app 的 @executable_path/Frameworks/，故把对
+        # CydiaSubstrate 的依赖改写为该路径，运行时 loader 才能找到 ellekit。
+        run: |
+          set -o pipefail
+          {
+            DYLIB=$(find .theos/_ -name 'chatswipe.dylib' | head -1)
+            if [ -z "$DYLIB" ]; then echo "ERROR: staged dylib not found"; find .theos -name '*.dylib' | head; exit 1; fi
+            CUR=$(otool -L "$DYLIB" | grep -i 'CydiaSubstrate.framework/CydiaSubstrate' | awk '{print $1}' | head -1)
+            echo "staged dylib: $DYLIB"
+            echo "current CydiaSubstrate dep: $CUR"
+            echo "before:"; otool -L "$DYLIB" | grep -i cydiasubstrate || true
+            if [ -n "$CUR" ]; then
+              install_name_tool -change "$CUR" @executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate "$DYLIB"
+            else
+              echo "WARN: dylib 中未发现 CydiaSubstrate 依赖！"
+            fi
+            ldid -S "$DYLIB"
+            echo "after:"; otool -L "$DYLIB" | grep -i cydiasubstrate || true
+            rm -f packages/*.deb
+            dpkg-deb -b .theos/_ "packages/chatswipe.deb"
+            echo "=== deb contents ==="; dpkg-deb -c packages/chatswipe.deb
+          } 2>&1 | tee -a build.log
 
-      - name: Upload artifact
+      - name: Upload build log (always, for diagnostics)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chatswipe
-          path: packages/*
+          name: build-log
+          path: build.log
+
+      - name: Upload deb
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatswipe-rootless
+          path: packages/*.deb

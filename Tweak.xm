@@ -23,7 +23,7 @@ static void chatswipe_loadConfig() {
             if ([cfg objectForKey:@"PasteEnabled"])  gPasteEnabled = [[cfg objectForKey:@"PasteEnabled"]  boolValue];
             if ([cfg objectForKey:@"Threshold"])     gThreshold    = [[cfg objectForKey:@"Threshold"]     floatValue];
         }
-    } @catch (...) {}
+    } @catch (id e) {}
 }
 
 // ==================== 共享 pan delegate：允许与原生文本选择手势并存 ====================
@@ -66,7 +66,7 @@ static void chatswipe_clear(UIView *view) {
             tf.text = @"";
             [tf sendActionsForControlEvents:UIControlEventEditingChanged];
         }
-    } @catch (...) {}
+    } @catch (id e) {}
 }
 
 static void chatswipe_paste(UIView *view) {
@@ -89,7 +89,7 @@ static void chatswipe_paste(UIView *view) {
                 tf.text = [tf.text stringByAppendingString:pb];
             [tf sendActionsForControlEvents:UIControlEventEditingChanged];
         }
-    } @catch (...) {}
+    } @catch (id e) {}
 }
 
 // ==================== pan 回调（挂在 UIView 上，所有输入框都能响应） ====================
