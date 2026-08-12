@@ -126,6 +126,12 @@ static void chatswipe_paste(UIView *view) {
     if (r) chatswipe_attachIfNeeded(self);
     return r;
 }
+// 兜底：输入框显示到窗口即挂手势，不依赖它先成为 first responder。
+// 否则首次打开聊天页、键盘未弹出时输入框已可见但未 becomeFirstResponder，手势漏挂 → 首次滑动无效。
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window) chatswipe_attachIfNeeded(self);
+}
 %end
 
 %hook UITextField
@@ -133,6 +139,10 @@ static void chatswipe_paste(UIView *view) {
     BOOL r = %orig;
     if (r) chatswipe_attachIfNeeded(self);
     return r;
+}
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window) chatswipe_attachIfNeeded(self);
 }
 %end
 
