@@ -151,7 +151,7 @@ static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id con
     Class sc = cls;
     while (sc) {
         NSValue *v = [gEditMenuOrig objectForKey:NSStringFromClass(sc)];
-        if (v) { orig = [v pointerValue]; break; }
+        if (v) { orig = (IMP)[v pointerValue]; break; }
         sc = class_getSuperclass(sc);
     }
     id origMenu = nil;
