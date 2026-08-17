@@ -149,25 +149,30 @@ static void chatswipe_paste(UIView *view) {
     return %orig;
 }
 
-- (void)buildMenuWithBuilder:(UIMenuBuilder *)builder {
+- (void)buildMenuWithBuilder:(id)builder {
     %orig;
     if (!gMenuFilterEnabled) return;
-    if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
-        @try {
-            NSString *editId = @"com.apple.menu.identifier.edit";
-            [builder replaceChildrenOfMenuForIdentifier:editId withChildren:^NSArray *(NSArray *children) {
-                NSMutableArray *keep = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
+            @try {
+                NSString *editId = @"com.apple.menu.identifier.edit";
                 Class cmdCls = NSClassFromString(@"UICommand");
-                for (id el in children) {
-                    if ([el isKindOfClass:[UIMenu class]]) continue; // 丢弃所有子菜单（替换/分享/查找 等下拉）
-                    if (cmdCls && [el isKindOfClass:cmdCls]) {
-                        SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                        if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+                Class menuCls = NSClassFromString(@"UIMenu");
+                id block = ^NSArray *(NSArray *children) {
+                    NSMutableArray *keep = [NSMutableArray array];
+                    for (id el in children) {
+                        if (menuCls && [el isKindOfClass:menuCls]) continue; // 丢弃所有子菜单（替换/分享/查找 等下拉）
+                        if (cmdCls && [el isKindOfClass:cmdCls]) {
+                            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+                        }
                     }
-                }
-                return keep;
-            }];
-        } @catch (id e) {}
+                    return keep;
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(builder,
+                    @selector(replaceChildrenOfMenuForIdentifier:withChildren:), editId, block);
+            } @catch (id e) {}
+        }
     }
 }
 %end
@@ -179,25 +184,30 @@ static void chatswipe_paste(UIView *view) {
     return %orig;
 }
 
-- (void)buildMenuWithBuilder:(UIMenuBuilder *)builder {
+- (void)buildMenuWithBuilder:(id)builder {
     %orig;
     if (!gMenuFilterEnabled) return;
-    if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
-        @try {
-            NSString *editId = @"com.apple.menu.identifier.edit";
-            [builder replaceChildrenOfMenuForIdentifier:editId withChildren:^NSArray *(NSArray *children) {
-                NSMutableArray *keep = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
+            @try {
+                NSString *editId = @"com.apple.menu.identifier.edit";
                 Class cmdCls = NSClassFromString(@"UICommand");
-                for (id el in children) {
-                    if ([el isKindOfClass:[UIMenu class]]) continue;
-                    if (cmdCls && [el isKindOfClass:cmdCls]) {
-                        SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                        if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+                Class menuCls = NSClassFromString(@"UIMenu");
+                id block = ^NSArray *(NSArray *children) {
+                    NSMutableArray *keep = [NSMutableArray array];
+                    for (id el in children) {
+                        if (menuCls && [el isKindOfClass:menuCls]) continue;
+                        if (cmdCls && [el isKindOfClass:cmdCls]) {
+                            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+                        }
                     }
-                }
-                return keep;
-            }];
-        } @catch (id e) {}
+                    return keep;
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(builder,
+                    @selector(replaceChildrenOfMenuForIdentifier:withChildren:), editId, block);
+            } @catch (id e) {}
+        }
     }
 }
 %end
