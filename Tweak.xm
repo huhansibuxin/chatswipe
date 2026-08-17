@@ -219,7 +219,7 @@ static void chatmenu_hookEditMenuDelegateForInput(id input) {
 
     if (!gEditMenuOrig) gEditMenuOrig = [NSMutableDictionary dictionary];
     IMP orig = NULL;
-    MSHookMessageEx(delegateClass, editSel, (IMP)chatmenu_editMenuReplacement, &orig);  // PAC 安全
+    MSHookMessageEx(delegateClass, editSel, (void *)chatmenu_editMenuReplacement, &orig);  // PAC 安全
     if (orig) {
         [gEditMenuOrig setObject:[NSValue valueWithPointer:orig] forKey:NSStringFromClass(delegateClass)];
     }
