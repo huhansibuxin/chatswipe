@@ -241,6 +241,7 @@ static void chatswipe_paste(UIView *view) {
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
+    @try { chatmenu_log([NSString stringWithFormat:@"[cpa] %@", NSStringFromSelector(action)]); } @catch (id e) {}
     if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
     return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
 }
@@ -248,6 +249,7 @@ static void chatswipe_paste(UIView *view) {
 // iOS 16 主拦截点（基类实例 + 子类未 override 的情形）：过滤 + 排序。
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
+    @try { chatmenu_log([NSString stringWithFormat:@"[emi] self=%@", NSStringFromClass([self class])]); } @catch (id e) {}
     id origMenu = %orig;
     return chatmenu_filterAndOrderMenu(origMenu);
 }
@@ -302,6 +304,7 @@ static void chatswipe_paste(UIView *view) {
 
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
+    @try { chatmenu_log([NSString stringWithFormat:@"[emi] self=%@", NSStringFromClass([self class])]); } @catch (id e) {}
     id origMenu = %orig;
     return chatmenu_filterAndOrderMenu(origMenu);
 }
@@ -334,30 +337,50 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
-// v1.5.0：iOS16 系统菜单（UIEditMenuInteraction）显示/更新时，KVC 过滤排序 _menu。
-// 只处理"含文本编辑白名单项"的菜单（避免误伤图片/链接长按等）；_menu 私有 ivar 取不到则自动跳过。
+// v1.5.1：进入就打标 + 多 key 找 menu + dump children，定位 QQ 菜单是否走系统 UIEditMenuInteraction。
 %hook UIEditMenuInteraction
 - (void)updateVisibleMenu {
     %orig;
     if (!gMenuFilterEnabled) return;
     @try {
-        id menu = [self valueForKey:@"_menu"];
-        if (!menu) return;
-        // 只处理含白名单项的菜单（文本编辑菜单），其他菜单原样放行
+        chatmenu_log(@"[ucUpdate] called");
+        id menu = nil;
+        NSArray *keys = @[@"_menu", @"menu", @"_menuItems", @"menuItems"];
+        for (NSString *k in keys) {
+            @try {
+                id v = [self valueForKey:k];
+                if (v && [v isKindOfClass:NSClassFromString(@"UIMenu")]) {
+                    menu = v;
+                    chatmenu_log([NSString stringWithFormat:@"[ucUpdate] menu via %@", k]);
+                    break;
+                }
+            } @catch (id e) {}
+        }
+        if (!menu) { chatmenu_log(@"[ucUpdate] no menu via KVC"); return; }
         BOOL hasWhitelist = NO;
         Class cmdCls = NSClassFromString(@"UICommand");
         NSArray *ch = [menu valueForKey:@"children"];
+        chatmenu_log([NSString stringWithFormat:@"[ucUpdate] children=%lu", (unsigned long)ch.count]);
         for (id el in ch) {
+            NSString *extra = @"";
+            if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
             if (cmdCls && [el isKindOfClass:cmdCls]) {
                 SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                if (chatmenu_isAllowedAction(a)) { hasWhitelist = YES; break; }
+                extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
+                if (chatmenu_isAllowedAction(a)) hasWhitelist = YES;
             }
+            chatmenu_log([NSString stringWithFormat:@"[ucUpdate]  - %@ %@", [el class], extra]);
         }
         if (!hasWhitelist) return;
         id filtered = chatmenu_filterAndOrderMenu(menu);
         if (filtered != menu) {
-            [self setValue:filtered forKey:@"_menu"];
-            chatmenu_log(@"[editMenuUpdate] filtered+ordered");
+            for (NSString *k in keys) {
+                @try {
+                    [self setValue:filtered forKey:k];
+                    chatmenu_log([NSString stringWithFormat:@"[ucUpdate] set %@ OK", k]);
+                    break;
+                } @catch (id e) {}
+            }
         }
     } @catch (id e) {}
 }
@@ -372,6 +395,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.0 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.1 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
