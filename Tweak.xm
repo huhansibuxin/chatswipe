@@ -583,6 +583,59 @@ static void chatswipe_paste(UIView *view) {
     }
     return items;
 }
+
+// v1.4.1：QQ 创建 UIMenuItem 但不走 setMenuItems:/menuItems getter（私有路径直接改 ivar）。
+// 显示前（setMenuVisible:animated: / update）通过 KVC 过滤私有 ivar _menuItems 中的非白名单项。
+- (void)setMenuVisible:(BOOL)visible animated:(BOOL)animated {
+    if (gMenuFilterEnabled && visible) {
+        @try {
+            NSArray *items = [self valueForKey:@"_menuItems"];
+            if (items && items.count > 0) {
+                NSMutableArray *keep = [NSMutableArray array];
+                for (id item in items) {
+                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
+                    if (chatmenu_isAllowedAction(a)) {
+                        [keep addObject:item];
+                    } else {
+                        chatmenu_log([NSString stringWithFormat:@"[ucVisible] drop title=%@ action=%@",
+                                      [item valueForKey:@"title"] ?: @"", NSStringFromSelector(a)]);
+                    }
+                }
+                if (keep.count != items.count) {
+                    [self setValue:keep forKey:@"_menuItems"];
+                    chatmenu_log([NSString stringWithFormat:@"[ucVisible] filtered %lu -> %lu",
+                                  (unsigned long)items.count, (unsigned long)keep.count]);
+                }
+            }
+        } @catch (id e) {}
+    }
+    %orig;
+}
+- (void)update {
+    if (gMenuFilterEnabled) {
+        @try {
+            NSArray *items = [self valueForKey:@"_menuItems"];
+            if (items && items.count > 0) {
+                NSMutableArray *keep = [NSMutableArray array];
+                for (id item in items) {
+                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
+                    if (chatmenu_isAllowedAction(a)) {
+                        [keep addObject:item];
+                    } else {
+                        chatmenu_log([NSString stringWithFormat:@"[ucUpdate] drop title=%@ action=%@",
+                                      [item valueForKey:@"title"] ?: @"", NSStringFromSelector(a)]);
+                    }
+                }
+                if (keep.count != items.count) {
+                    [self setValue:keep forKey:@"_menuItems"];
+                    chatmenu_log([NSString stringWithFormat:@"[ucUpdate] filtered %lu -> %lu",
+                                  (unsigned long)items.count, (unsigned long)keep.count]);
+                }
+            }
+        } @catch (id e) {}
+    }
+    %orig;
+}
 %end
 
 // ==================== v1.3.9 运行时探测（QQ 自绘菜单定位） ====================
@@ -827,6 +880,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.4.0 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.4.1 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
