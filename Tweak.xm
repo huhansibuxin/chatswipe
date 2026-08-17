@@ -171,18 +171,35 @@ static IMP chatmenu_lookupOrig(Class cls) {
 }
 
 // 统一的 replacement（C 函数，供 MSHookMessageEx 使用；PAC 安全）
+// ⚠️ 严禁直接对 interaction 调用不存在的 selector（如 interaction.view）—— UIEditMenuInteraction 无 view 方法，
+//    直接 objc_msgSend 会触发 unrecognized selector 而闪退（v1.2.1 / v1.2.4 即因此闪退）。
+//    改用 configuration 的 sourceView / editView 安全判定是否为输入框菜单。
 static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested) {
     IMP orig = chatmenu_lookupOrig(object_getClass(self));
     if (!orig) return nil;   // 理论上不会发生（该类已被我们 hook）
     if (!gMenuFilterEnabled) {
         return ((id (*)(id, SEL, id, id, NSArray *))orig)(self, _cmd, interaction, config, suggested);
     }
-    id menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, _cmd, interaction, config, suggested);
+    id menu = nil;
+    @try {
+        menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, _cmd, interaction, config, suggested);
+    } @catch (id e) { menu = nil; }
     if (!menu) return menu;
-    // 只过滤"关联输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
-    id view = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(view));
-    if (view && ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]])) {
-        return chatmenu_filterMenu(menu);
+    // 只过滤"关联输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行。
+    // 安全判定：通过 configuration 的 sourceView / editView 判断（全程 respondsToSelector 保护，绝不裸调不存在的 selector）。
+    BOOL isTextInputMenu = NO;
+    @try {
+        if (config && [config respondsToSelector:@selector(editView)]) {
+            id src = [config editView];
+            if (src && ([src isKindOfClass:[UITextView class]] || [src isKindOfClass:[UITextField class]])) isTextInputMenu = YES;
+        }
+        if (!isTextInputMenu && config && [config respondsToSelector:@selector(sourceView)]) {
+            id src = [config sourceView];
+            if (src && ([src isKindOfClass:[UITextView class]] || [src isKindOfClass:[UITextField class]])) isTextInputMenu = YES;
+        }
+    } @catch (id e) {}
+    if (isTextInputMenu) {
+        @try { return chatmenu_filterMenu(menu); } @catch (id e) { return menu; }
     }
     return menu;
 }
@@ -476,7 +493,7 @@ static void chatswipe_paste(UIView *view) {
     // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
     @try {
         NSString *path = @"/var/jb/tmp/chatswipe_loaded.log";
-        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.0 loaded %@\n", [NSDate date]];
+        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.5 loaded %@\n", [NSDate date]];
         [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
