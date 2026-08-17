@@ -556,6 +556,33 @@ static void chatswipe_paste(UIView *view) {
     }
     %orig;
 }
+
+// v1.4.0：v1.3.9 探测实锤——QQ 的"换行/全屏输入"是 UIMenuItem（initWithTitle:action: 被调，
+// action=MenuWrapWithSender: / allScreenInputWithSender:），但显示时走 menuItems GETTER 读取
+//（不走 setMenuItems: setter，故 v1.3.6 只 hook setter 拦不到）。这里在 getter 过滤非白名单项。
+- (NSArray *)menuItems {
+    NSArray *items = %orig;
+    if (gMenuFilterEnabled && items && items.count > 0) {
+        @try {
+            NSMutableArray *keep = [NSMutableArray array];
+            for (id item in items) {
+                SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
+                if (chatmenu_isAllowedAction(a)) {
+                    [keep addObject:item];
+                } else {
+                    chatmenu_log([NSString stringWithFormat:@"[ucMenu-getter] drop title=%@ action=%@",
+                                  [item valueForKey:@"title"] ?: @"", NSStringFromSelector(a)]);
+                }
+            }
+            if (keep.count != items.count) {
+                chatmenu_log([NSString stringWithFormat:@"[ucMenu-getter] filtered %lu -> %lu",
+                              (unsigned long)items.count, (unsigned long)keep.count]);
+                return keep;
+            }
+        } @catch (id e) {}
+    }
+    return items;
+}
 %end
 
 // ==================== v1.3.9 运行时探测（QQ 自绘菜单定位） ====================
@@ -800,6 +827,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.9 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.4.0 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
