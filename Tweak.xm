@@ -303,6 +303,46 @@ static void chatswipe_paste(UIView *view) {
 // 懒加载子类 hook（MSHookMessageEx，PAC 安全，交互期一次性）：
 //   在 canPerformAction: 触发时，chatmenu_hookEditMenuForClassIfNeeded 对 self 真实类做 hook editMenuInteraction:，
 //   删掉子类 App 自定义项（QQ 换行/全屏输入、微信 #话题/搜一搜 等）。
+//
+// 新增（v1.3.2）：App 自定义菜单项的标准注入点是 UITextViewDelegate 的
+//   textView:editMenuForTextRange:suggestedActions:（iOS16 新增，静态确认 QQ 二进制含此 selector）。
+//   全局 %hook NSObject 拦截该方法，过滤返回的 suggestedActions 数组（保留白名单 UICommand，
+//   丢弃 UIAction 与其余项）→ 从源头挡掉 换行/全屏输入/#话题/搜一搜 等 App 自定义项（QQ/TG/微信 通用）。
+//   注：若 App delegate 自身 override 了该方法，NSObject 基类 hook 会被绕过 → 由下面
+//   editMenuInteraction: 过滤 + 懒加载子类 hook 兜底；本块同时带诊断日志确认触发情况。
+%hook NSObject
+- (id)textView:(id)textView editMenuForTextRange:(id)range suggestedActions:(id)suggestedActions {
+    id orig = %orig;
+    if (!gMenuFilterEnabled) return orig;
+    if (!textView || !suggestedActions || ![suggestedActions isKindOfClass:[NSArray class]]) return orig;
+    @try {
+        NSArray *arr = (NSArray *)suggestedActions;
+        chatmenu_log([NSString stringWithFormat:@"[textMenu] delegate=%@ textView=%@ count=%lu",
+                      NSStringFromClass([self class]), NSStringFromClass([textView class]),
+                      (unsigned long)arr.count]);
+        NSMutableArray *keep = [NSMutableArray array];
+        Class cmdCls = NSClassFromString(@"UICommand");
+        Class actionCls = NSClassFromString(@"UIAction");
+        for (id el in arr) {
+            if (cmdCls && [el isKindOfClass:cmdCls]) {
+                SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                if (chatmenu_isAllowedAction(a)) { [keep addObject:el]; }
+            } else if (actionCls && [el isKindOfClass:actionCls]) {
+                // App 自定义 UIAction：丢弃
+            } else {
+                [keep addObject:el];
+            }
+        }
+        if (keep.count != arr.count) {
+            chatmenu_log([NSString stringWithFormat:@"[textMenu] filtered %lu -> %lu",
+                          (unsigned long)arr.count, (unsigned long)keep.count]);
+            return keep;
+        }
+        return arr;
+    } @catch (id e) { return orig; }
+}
+%end
+
 %hook UITextView
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
@@ -329,6 +369,23 @@ static void chatswipe_paste(UIView *view) {
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
     id origMenu = %orig;
+    @try {
+        Class menuCls = NSClassFromString(@"UIMenu");
+        if (menuCls && [origMenu isKindOfClass:menuCls]) {
+            NSArray *ch = [origMenu valueForKey:@"children"];
+            chatmenu_log([NSString stringWithFormat:@"[menu] self=%@ children=%lu",
+                          NSStringFromClass([self class]), (unsigned long)ch.count]);
+            for (id el in ch) {
+                NSString *extra = @"";
+                if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
+                if ([el isKindOfClass:NSClassFromString(@"UICommand")]) {
+                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                    extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
+                }
+                chatmenu_log([NSString stringWithFormat:@"[menu]  - %@ %@", [el class], extra]);
+            }
+        }
+    } @catch (id e) {}
     return chatmenu_filterMenu(origMenu);
 }
 
@@ -386,6 +443,23 @@ static void chatswipe_paste(UIView *view) {
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
     id origMenu = %orig;
+    @try {
+        Class menuCls = NSClassFromString(@"UIMenu");
+        if (menuCls && [origMenu isKindOfClass:menuCls]) {
+            NSArray *ch = [origMenu valueForKey:@"children"];
+            chatmenu_log([NSString stringWithFormat:@"[menu] self=%@ children=%lu",
+                          NSStringFromClass([self class]), (unsigned long)ch.count]);
+            for (id el in ch) {
+                NSString *extra = @"";
+                if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
+                if ([el isKindOfClass:NSClassFromString(@"UICommand")]) {
+                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                    extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
+                }
+                chatmenu_log([NSString stringWithFormat:@"[menu]  - %@ %@", [el class], extra]);
+            }
+        }
+    } @catch (id e) {}
     return chatmenu_filterMenu(origMenu);
 }
 
