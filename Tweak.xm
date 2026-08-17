@@ -57,6 +57,42 @@ static id chatmenu_filterMenu(id menu) {
     return [menuCls performSelector:@selector(menuWithChildren:) withObject:keep];
 }
 
+// ==================== 诊断日志 + App 类判定（避免 hook 系统/框架类导致 PAC 崩溃） ====================
+// 写 /var/jb/tmp/chatswipe.log，每次 dylib 加载先清空（满足"清除上一版本日志"要求），再分步记录。
+// 若仍崩溃，老板回来 SSH: cat /var/jb/tmp/chatswipe.log 看最后一句即知崩在哪一步。
+static void chatmenu_log(NSString *msg) {
+    @try {
+        NSString *path = @"/var/jb/tmp/chatswipe.log";
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        }
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[[NSString stringWithFormat:@"%@\n", msg] dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh synchronizeFile];
+            [fh closeFile];
+        }
+    } @catch (id e) {}
+}
+
+// 只 hook App 自己的类（主可执行文件 / App 内嵌 framework），跳过 UIKit 等系统/rootless 框架内部类。
+// 原因：对系统内部 text view 子类 hook canPerformAction:（启动期高频调用）在 iOS16 ARM64e 下会导致崩溃。
+static BOOL chatmenu_isAppClass(Class cls) {
+    if (!cls) return NO;
+    const char *img = class_getImageName(cls);
+    if (!img || img[0] == '\0') return NO;
+    NSString *path = [NSString stringWithUTF8String:img];
+    if ([path hasPrefix:@"/System/Library/"]) return NO;
+    if ([path hasPrefix:@"/Library/"])        return NO;
+    if ([path hasPrefix:@"/usr/"])            return NO;
+    if ([path hasPrefix:@"/var/jb/Library/"]) return NO;
+    if ([path hasPrefix:@"/var/jb/usr/"])     return NO;
+    if ([path hasPrefix:@"/Applications/"])   return NO;
+    return YES; // /var/containers/.../App.app 或 App 内嵌 Frameworks
+}
+
 // ==================== 动态 hook 文本框子类（App 常自定义子类，如微信 WCInputTextView） ====================
 // Logos %hook 仅替换基类方法。若 App 在 UITextView/UITextField 的【子类】上重写
 // canPerformAction: / editMenuInteraction:...，基类 hook 会被绕过 → 菜单毫无变化（v1.1.1 实测如此）。
@@ -140,6 +176,7 @@ static void chatmenu_hookTextViewSubclasses() {
         BOOL isTV = [cls isSubclassOfClass:tvCls];
         BOOL isTF = [cls isSubclassOfClass:tfCls];
         if (!isTV && !isTF) continue;
+        if (!chatmenu_isAppClass(cls)) continue;   // 只 hook App 自己的类，跳过 UIKit 系统内部类（避免 PAC 崩溃）
 
         NSString *key = [NSString stringWithUTF8String:class_getName(cls)];
         if ([gHookedClasses containsObject:key]) continue;          // 已 hook，防重复替换导致递归
@@ -189,6 +226,7 @@ static IMP chatmenu_lookupOrig(Class cls) {
 //    直接 objc_msgSend 会触发 unrecognized selector 而闪退（v1.2.1 / v1.2.4 即因此闪退）。
 //    改用 configuration 的 sourceView / editView 安全判定是否为输入框菜单。
 static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested) {
+    static BOOL sLogged = NO; if (!sLogged) { sLogged = YES; chatmenu_log(@"[editMenu] replacement hit"); }
     IMP orig = chatmenu_lookupOrig(object_getClass(self));
     if (!orig) return nil;   // 理论上不会发生（该类已被我们 hook）
     if (!gMenuFilterEnabled) {
@@ -235,6 +273,8 @@ static void chatmenu_hookEditMenuDelegateForInput(id input) {
     if (!delegate) return;
 
     Class delegateClass = [delegate class];
+    chatmenu_log([NSString stringWithFormat:@"[delegate] candidate class=%s", class_getName(delegateClass)]);
+    if (!chatmenu_isAppClass(delegateClass)) { chatmenu_log(@"[delegate] skip system class"); return; }  // 跳过 UIKit 系统内部 coordinator（避免 PAC 崩溃）
     // 输入框本身（或其子类）由 Logos %hook 处理，跳过
     if ([delegateClass isSubclassOfClass:[UITextView class]] ||
         [delegateClass isSubclassOfClass:[UITextField class]]) {
@@ -492,23 +532,25 @@ static void chatswipe_paste(UIView *view) {
 %end
 
 %ctor {
+    // 清空上一版本日志（满足"每次更新清除旧日志"要求），再开始记录
+    @try { [@"" writeToFile:@"/var/jb/tmp/chatswipe.log" atomically:NO encoding:NSUTF8StringEncoding error:nil]; } @catch (id e) {}
+    chatmenu_log(@"[ctor] start v1.2.8");
     chatswipe_loadConfig();
-    // 动态 hook 文本框子类：基类 + 未重写方法的子类由 Logos %hook 覆盖；
+    // 动态 hook 文本框子类：仅 hook【App 自己的类】（chatmenu_isAppClass 已排掉 UIKit 系统内部类）。
     // 重写过的子类（如微信 WCInputTextView）需逐一替换 IMP，否则菜单无变化。
-    chatmenu_hookTextViewSubclasses();
+    @try {
+        chatmenu_log(@"[ctor] hook subclasses begin");
+        chatmenu_hookTextViewSubclasses();
+        chatmenu_log(@"[ctor] hook subclasses done");
+    } @catch (id e) {
+        chatmenu_log([NSString stringWithFormat:@"[ctor] hook subclasses EXCEPTION: %@", e]);
+    }
     // 二次扫描：捕获 %ctor 时尚未 realize 的懒加载子类（部分 App 延后注册类）。
-    // gHookedClasses 防重复；重复进入会因 method_setImplementation 把 block 当 orig 而递归爆栈。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        chatmenu_hookTextViewSubclasses();
+        @try { chatmenu_hookTextViewSubclasses(); chatmenu_log(@"[ctor] hook subclasses 2nd done"); }
+        @catch (id e) { chatmenu_log([NSString stringWithFormat:@"[ctor] hook subclasses 2nd EXCEPTION: %@", e]); }
     });
-    // 加载验证：写文件标记，确认 dylib 被 TrollFools 注入并加载（iOS 16 rootless 世界 /var/jb/tmp 可写）。
-    // 每次新版本覆盖写入（不清除旧日志的话多版本叠加难以辨认）。
-    // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
-    @try {
-        NSString *path = @"/var/jb/tmp/chatswipe_loaded.log";
-        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.7 loaded %@\n", [NSDate date]];
-        [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } @catch (id e) {}
+    chatmenu_log(@"[ctor] loaded");
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
