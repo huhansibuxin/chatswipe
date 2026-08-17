@@ -26,15 +26,17 @@ jobs:
       - name: Install SDK
         run: |
           cd ${{ runner.temp }}/theos/sdks
-          for i in 1 2 3 4 5; do
-            curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o master.zip
-            if unzip -tq master.zip >/dev/null 2>&1; then break; fi
-            echo "SDK zip bad, retry $i"
-            sleep 8
+          # git sparse-checkout 只拉 iPhoneOS16.5.sdk 目录（走 git 协议，绕过 codeload archive 限流导致 master.zip 反复坏包）
+          for i in 1 2 3; do
+            rm -rf sdkrepo
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdkrepo && break
+            echo "sdk clone retry $i"; sleep 10
           done
-          unzip -q master.zip
-          mv sdks-master/iPhoneOS16.5.sdk .
-          rm -rf sdks-master master.zip
+          cd sdkrepo
+          git sparse-checkout set iPhoneOS16.5.sdk
+          cp -R iPhoneOS16.5.sdk ../
+          cd ..
+          rm -rf sdkrepo
 
       - name: Build
         run: |
