@@ -143,6 +143,62 @@ static void chatmenu_hookTextViewSubclasses() {
     free(classes);
 }
 
+// ==================== 精准 hook 输入框 edit menu 的 delegate（不碰 NSObject） ====================
+// iOS 16 的 UIEditMenuInteraction delegate 通常是 App 的 VC/Coordinator，不是输入框本身，
+// 所以挂在 UITextView/UITextField 上的 editMenuInteraction:... 不会被调用。
+// 这里只针对"输入框"：从其内部 editMenuInteraction 拿到真正的 delegate 对象，
+// 仅替换【那个 delegate 类】的 editMenuInteraction:menuForConfiguration:suggestedActions:，
+// 绝不动 NSObject，也不会影响其他对象。内部仍用 interaction.view 判断关联的是否为输入框。
+static void chatmenu_hookEditMenuDelegateForInput(id input) {
+    if (!gMenuFilterEnabled || !input) return;
+    if (![input isKindOfClass:[UITextView class]] && ![input isKindOfClass:[UITextField class]]) return;
+
+    id interaction = nil;
+    @try {
+        if ([input respondsToSelector:@selector(editMenuInteraction)]) {
+            interaction = ((id (*)(id, SEL))objc_msgSend)(input, @selector(editMenuInteraction));
+        }
+        if (!interaction) interaction = [input valueForKey:@"_editMenuInteraction"];
+    } @catch (id e) {}
+
+    if (!interaction || ![interaction respondsToSelector:@selector(delegate)]) return;
+    id delegate = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(delegate));
+    if (!delegate) return;
+
+    Class delegateClass = [delegate class];
+    // 输入框本身（或其子类）由 Logos %hook 处理，跳过
+    if ([delegateClass isSubclassOfClass:[UITextView class]] ||
+        [delegateClass isSubclassOfClass:[UITextField class]]) {
+        return;
+    }
+
+    NSString *key = [NSString stringWithFormat:@"editmenu_%s", class_getName(delegateClass)];
+    if ([gHookedClasses containsObject:key]) return;   // 已处理，防递归/重复
+
+    SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
+    if (!chatmenu_classOverridesSelector(delegateClass, editSel)) {
+        [gHookedClasses addObject:key]; // 标记已检查，避免重复探测
+        return;
+    }
+
+    Method m = class_getInstanceMethod(delegateClass, editSel);
+    IMP orig = method_getImplementation(m);
+    IMP repl = imp_implementationWithBlock(^id(id self, id interaction, id config, NSArray *suggested) {
+        if (!gMenuFilterEnabled) {
+            return ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
+        }
+        id menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
+        // 只过滤"关联输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
+        id view = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(view));
+        if (view && ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]])) {
+            return chatmenu_filterMenu(menu);
+        }
+        return menu;
+    });
+    method_setImplementation(m, repl);
+    [gHookedClasses addObject:key];
+}
+
 static void chatswipe_loadConfig() {
     @try {
         NSString *path = @"/var/mobile/Documents/chatswipe.plist";
@@ -351,52 +407,30 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
-// ==================== 全局拦截 editMenuInteraction delegate（关键修复） ====================
-// iOS 16 下 UIEditMenuInteraction 的 delegate 通常【不是】UITextView/UITextField 本身，
-// 而是 App 的 ViewController / Coordinator 等对象。所以挂在基类上的
-// editMenuInteraction:menuForConfiguration:suggestedActions: 永远不会被调用到，
-// 导致 #话题/搜一搜/换行/全屏输入 等 App 自定义项无法被过滤（v1.1.x 实测如此）。
-// 解决方案：把该方法挂到 NSObject 上，无论谁是 delegate 都能拦截；
-// 再通过 interaction.view 判断关联的是否为输入框，避免误伤其他菜单（图片长按等）。
-%hook NSObject
-- (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
-    id result = %orig;
-    if (!gMenuFilterEnabled || !result) return result;
-    @try {
-        // 只过滤"文本输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
-        id view = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(view));
-        if (view && ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]])) {
-            return chatmenu_filterMenu(result);
-        }
-    } @catch (id e) {}
-    return result;
-}
-%end
-
 // ==================== Hook：输入框成为第一响应者时挂手势 ====================
 %hook UITextView
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
-    if (r) chatswipe_attachIfNeeded(self);
+    if (r) { chatswipe_attachIfNeeded(self); chatmenu_hookEditMenuDelegateForInput(self); }
     return r;
 }
 // 兜底：输入框显示到窗口即挂手势，不依赖它先成为 first responder。
 // 否则首次打开聊天页、键盘未弹出时输入框已可见但未 becomeFirstResponder，手势漏挂 → 首次滑动无效。
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) chatswipe_attachIfNeeded(self);
+    if (self.window) { chatswipe_attachIfNeeded(self); chatmenu_hookEditMenuDelegateForInput(self); }
 }
 %end
 
 %hook UITextField
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
-    if (r) chatswipe_attachIfNeeded(self);
+    if (r) { chatswipe_attachIfNeeded(self); chatmenu_hookEditMenuDelegateForInput(self); }
     return r;
 }
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) chatswipe_attachIfNeeded(self);
+    if (self.window) { chatswipe_attachIfNeeded(self); chatmenu_hookEditMenuDelegateForInput(self); }
 }
 %end
 
