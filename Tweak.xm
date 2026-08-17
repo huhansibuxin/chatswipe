@@ -25,6 +25,37 @@ static BOOL chatmenu_isAllowedAction(SEL action) {
     return NO;
 }
 
+// 递归过滤 UIMenu：保留白名单 UICommand（paste/copy/selectAll），丢弃 UIAction（App 自定义项）
+// 以及子菜单中其余非白名单项；无变化时原样返回（避免无谓重建）。
+static id chatmenu_filterMenu(id menu) {
+    if (!menu) return nil;
+    Class menuCls   = NSClassFromString(@"UIMenu");
+    Class cmdCls    = NSClassFromString(@"UICommand");
+    Class actionCls = NSClassFromString(@"UIAction");
+    if (!menuCls || ![menu isKindOfClass:menuCls]) return menu; // 非 UIMenu（如单个 UICommand）交给上层判断
+    NSArray *children = [menu valueForKey:@"children"];
+    if (!children || children.count == 0) return menu;
+    NSMutableArray *keep = [NSMutableArray array];
+    BOOL changed = NO;
+    for (id el in children) {
+        if (menuCls && [el isKindOfClass:menuCls]) {
+            id filtered = chatmenu_filterMenu(el); // 递归子菜单
+            if (filtered) [keep addObject:filtered];
+            else changed = YES;
+        } else if (cmdCls && [el isKindOfClass:cmdCls]) {
+            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+            else changed = YES;
+        } else if (actionCls && [el isKindOfClass:actionCls]) {
+            changed = YES; // App 自定义 UIAction：丢弃
+        } else {
+            [keep addObject:el]; // 其他未知元素保留
+        }
+    }
+    if (!changed) return menu;
+    return [menuCls performSelector:@selector(menuWithChildren:) withObject:keep];
+}
+
 static void chatswipe_loadConfig() {
     @try {
         NSString *path = @"/var/mobile/Documents/chatswipe.plist";
@@ -136,9 +167,14 @@ static void chatswipe_paste(UIView *view) {
 // 点击/长按输入框弹出的编辑菜单，各 App 内容不一：微信 #话题/搜一搜、QQ 换行/全屏输入、
 // 备忘录 格式/查找，以及系统"扫描文本"(scanDocument:)。统一成只显示三项：
 //   粘贴(paste:) / 复制(copy:) / 全选(selectAll:)
-// 两层拦截：
-//   1) canPerformAction:withSender: —— 决定每个动作是否可选，挡掉 App 自定义项与系统扫描文本；
-//   2) buildMenuWithBuilder:        —— iOS 13+ 改用 UIMenu 构建菜单，再物理移除非白名单项。
+// iOS 16 关键点：UIMenuController 已被 UIEditMenuInteraction 取代。App 自定义项（#话题/搜一搜/换行）
+// 是 App 在 delegate 方法 editMenuInteraction:menuForConfiguration:suggestedActions: 里以 UIAction
+// 追加到系统 suggestedActions 之后的，完全不经过 canPerformAction:。所以拦截点必须是：
+//   1) canPerformAction:withSender: —— 控制系统标准动作（paste/copy/cut/selectAll 等）是否进入
+//      suggestedActions；我们强制三件套为 YES、其余(NO)（含扫描文本 scanDocument 不在白名单）。
+//   2) editMenuInteraction:menuForConfiguration:suggestedActions: —— 对最终 UIMenu 递归过滤，
+//      保留白名单 UICommand(paste/copy/selectAll)，丢弃所有 UIAction（即 App 自定义项）。
+//   3) buildMenuWithBuilder: —— iOS 13–15 旧路径兜底（UIMenuController + UIMenuBuilder）。
 // 只 hook 输入框(UITextView/UITextField)，避免误伤 App 其他菜单（如长按消息气泡的 转发/删除）。
 // 本 dylib 由 TrollFools 注入目标 App，故仅在被注入 App 内生效（不注入 SpringBoard）。
 
@@ -149,6 +185,13 @@ static void chatswipe_paste(UIView *view) {
     return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
 }
 
+// iOS 16 主拦截点：App 自定义项在这里以 UIAction 追加。对最终 UIMenu 递归过滤。
+- (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
+    if (!gMenuFilterEnabled) return %orig;
+    return chatmenu_filterMenu(%orig);
+}
+
+// 兜底：iOS 13–15 旧路径（UIMenuController + UIMenuBuilder）；iOS 16 多走上面 editMenuInteraction。
 - (void)buildMenuWithBuilder:(id)builder {
     %orig;
     if (!gMenuFilterEnabled) return;
@@ -161,7 +204,7 @@ static void chatswipe_paste(UIView *view) {
                 id block = ^NSArray *(NSArray *children) {
                     NSMutableArray *keep = [NSMutableArray array];
                     for (id el in children) {
-                        if (menuCls && [el isKindOfClass:menuCls]) continue; // 丢弃所有子菜单（替换/分享/查找 等下拉）
+                        if (menuCls && [el isKindOfClass:menuCls]) continue;
                         if (cmdCls && [el isKindOfClass:cmdCls]) {
                             SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
                             if (chatmenu_isAllowedAction(a)) [keep addObject:el];
@@ -184,6 +227,11 @@ static void chatswipe_paste(UIView *view) {
     if ((action == @selector(copy:) || action == @selector(selectAll:)) && self.secureTextEntry) return %orig;
     if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
     return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
+}
+
+- (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
+    if (!gMenuFilterEnabled) return %orig;
+    return chatmenu_filterMenu(%orig);
 }
 
 - (void)buildMenuWithBuilder:(id)builder {
@@ -243,5 +291,16 @@ static void chatswipe_paste(UIView *view) {
 
 %ctor {
     chatswipe_loadConfig();
+    // 加载验证：写文件标记，确认 dylib 被 TrollFools 注入并加载（iOS 16 rootless 世界 /var/jb/tmp 可写）。
+    // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
+    @try {
+        NSString *path = @"/var/jb/tmp/chatswipe_loaded.log";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        [fh seekToEndOfFile];
+        [fh writeData:[[NSString stringWithFormat:@"loaded %@\n", [NSDate date]] dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (id e) {}
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
