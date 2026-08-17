@@ -1,31 +1,31 @@
-// ChatSwipe — 通用聊天输入框滑动手势 + 编辑菜单精简
+// ChatSwipe — 通用聊天输入框滑动手势 + 编辑菜单三件套（全选/复制/粘贴）
 // 设计：app 无关。只操作「当前 first responder 的 UITextView/UITextField」+ UIPasteboard。
 // 左滑 → 清空输入框；右滑 → 在光标处粘贴剪贴板。
-// 单击/长按输入框弹出的编辑菜单 → 只保留 粘贴/复制/全选，去掉 App 自定义项
-//（微信 #话题/搜一搜、QQ 换行/全屏输入、备忘录 格式/查找）与系统「扫描文本」(scanDocument:) 等。
+// 单击/长按输入框弹出的编辑菜单 → 只保留 全选/复制/粘贴（按此顺序），其余（扫描文本 scanDocument:、
+// 剪切、选择、替换、查找、翻译、分享、以及 App 自定义项 换行/全屏输入/#话题/搜一搜 等）一律移除。
 //
-// ⚠️ 稳定性铁律（v1.1.0 → v1.2.8 多轮闪退后定稿，老板实测教训）：
-//   - 编译期 %hook（Logos / MSHookMessageEx 底层，ARM64e PAC 安全，与滑动功能同机制）→ 不崩。
-//   - 禁止 %ctor 同步枚举 objc_getClassList 做运行时动态替换 —— 扫到 UIKit 系统内部类时 iOS16
-//     ARM64e 会 BRK 崩溃（v1.1.4/v1.2.1/v1.2.4/v1.2.7/v1.2.8 全部因此闪退）。
-//   - 唯一允许的运行时动态替换：v1.3.1 引入的【懒加载子类 hook】——
-//     在交互期（基类 canPerformAction: 触发时）对 self 真实类做一次性 MSHookMessageEx，
-//     配合 isAppClass 限定 + 已检查/已 hook 去重 + 沙盒日志定位，回避 %ctor 枚举崩源。
-//   - 加载/诊断日志一律写 App 沙盒 Documents（NSHomeDirectory()），严禁写 /var/jb/tmp ——
-//     App 进程沙盒内 /var/jb/tmp 不可写，写了也看不到（此前"没有日志"即因此）。
+// v1.5.0 精简版（老板拍板：放弃自绘菜单适配，只要三件套稳定 + 扫描文本必去掉）：
+//   - 删掉全部探针（UIButton/UIMenuItem/didMoveToWindow/presentViewController）
+//   - 删掉全部动态 hook（UIMenuController 全家 / 懒加载子类 / delegate hook / 交互期枚举 /
+//     NSObject 全局 editMenuInteraction / textView:editMenuForTextRange / inputAssistantItem）
+//   - 只保留编译期 %hook（与滑动功能同机制，ARM64e PAC 安全）：
+//       1) canPerformAction:withSender: —— 三件套强制显示，其余 NO（含 scanDocument 扫描文本，必去掉）
+//       2) editMenuInteraction:menuForConfiguration:suggestedActions: —— 对最终 UIMenu 过滤 + 排序
+//       3) UIEditMenuInteraction updateVisibleMenu —— iOS16 系统菜单显示/更新时，KVC 过滤排序 _menu
+//       4) buildMenuWithBuilder: —— iOS 13–15 旧路径兜底过滤
+//   - 排序：全选(selectAll:) → 复制(copy:) → 粘贴(paste:)
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
-#import <substrate.h>   // MSHookMessageEx（PAC 安全）用于懒加载子类 hook
 
 // ==================== 配置（可选 /var/mobile/Documents/chatswipe.plist） ====================
 static BOOL     gEnabled     = YES;   // 总开关
 static BOOL     gClearEnabled= YES;   // 左滑清空
 static BOOL     gPasteEnabled= YES;   // 右滑粘贴
 static CGFloat  gThreshold   = 45.0;  // 触发所需最小水平位移(pt)
-static BOOL     gMenuFilterEnabled = YES; // 编辑菜单精简总开关（只留 粘贴/复制/全选）
+static BOOL     gMenuFilterEnabled = YES; // 编辑菜单精简总开关（只留 全选/复制/粘贴）
 
 // ==================== 诊断日志（写 App 沙盒 Documents，%ctor 先清空 = 清除上一版本日志） ====================
 static void chatmenu_log(NSString *msg) {
@@ -46,18 +46,18 @@ static void chatmenu_log(NSString *msg) {
     } @catch (id e) {}
 }
 
-// ==================== 编辑菜单精简 ====================
-// 白名单：仅允许 粘贴/复制/全选 出现在输入框菜单中。
+// ==================== 编辑菜单三件套 ====================
+// 白名单：仅允许 全选/复制/粘贴 出现在输入框菜单中（扫描文本 scanDocument: 不在白名单 → 必去掉）。
 static BOOL chatmenu_isAllowedAction(SEL action) {
-    if (action == @selector(paste:))     return YES;
-    if (action == @selector(copy:))      return YES;
     if (action == @selector(selectAll:)) return YES;
+    if (action == @selector(copy:))      return YES;
+    if (action == @selector(paste:))     return YES;
     return NO;
 }
 
-// 递归过滤 UIMenu：保留白名单 UICommand（paste/copy/selectAll），丢弃 UIAction（App 自定义项）
-// 与其余非白名单项；无变化时原样返回（避免无谓重建）。
-static id chatmenu_filterMenu(id menu) {
+// 过滤 + 排序 UIMenu：只保留白名单 UICommand（selectAll/copy/paste），丢弃 UIAction（App 自定义项）
+// 与其余非白名单项（含扫描文本 scanDocument:）；白名单项按「全选 → 复制 → 粘贴」顺序重排；其他未知元素放末尾。
+static id chatmenu_filterAndOrderMenu(id menu) {
     if (!menu) return nil;
     Class menuCls   = NSClassFromString(@"UIMenu");
     Class cmdCls    = NSClassFromString(@"UICommand");
@@ -65,43 +65,54 @@ static id chatmenu_filterMenu(id menu) {
     if (!menuCls || ![menu isKindOfClass:menuCls]) return menu; // 非 UIMenu 交给上层判断
     NSArray *children = [menu valueForKey:@"children"];
     if (!children || children.count == 0) return menu;
-    NSMutableArray *keep = [NSMutableArray array];
-    BOOL changed = NO;
+
+    NSMutableArray *whitelist = [NSMutableArray array]; // 白名单 UICommand（待排序）
+    NSMutableArray *others    = [NSMutableArray array]; // 子菜单/未知元素（放末尾）
     for (id el in children) {
         if (menuCls && [el isKindOfClass:menuCls]) {
-            id filtered = chatmenu_filterMenu(el); // 递归子菜单
-            if (filtered) [keep addObject:filtered];
-            else changed = YES;
+            id f = chatmenu_filterAndOrderMenu(el); // 递归子菜单
+            if (f) [others addObject:f];
         } else if (cmdCls && [el isKindOfClass:cmdCls]) {
             SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
-            else changed = YES;
+            if (chatmenu_isAllowedAction(a)) {
+                [whitelist addObject:el];
+            }
+            // 非白名单 UICommand（含 scanDocument 扫描文本）：丢弃
         } else if (actionCls && [el isKindOfClass:actionCls]) {
-            changed = YES; // App 自定义 UIAction：丢弃
+            // App 自定义 UIAction：丢弃
         } else {
-            [keep addObject:el]; // 其他未知元素保留
+            [others addObject:el]; // 其他未知元素保留
+        }
+    }
+
+    // 排序：全选(selectAll:) → 复制(copy:) → 粘贴(paste:)
+    NSArray *order = @[NSStringFromSelector(@selector(selectAll:)),
+                       NSStringFromSelector(@selector(copy:)),
+                       NSStringFromSelector(@selector(paste:))];
+    NSMutableArray *sorted = [NSMutableArray array];
+    for (NSString *selName in order) {
+        for (id el in whitelist) {
+            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+            if ([NSStringFromSelector(a) isEqualToString:selName]) {
+                [sorted addObject:el];
+                break;
+            }
+        }
+    }
+    for (id el in whitelist) { // 理论不会有的多余白名单项，兜底放后面
+        if (![sorted containsObject:el]) [sorted addObject:el];
+    }
+    [sorted addObjectsFromArray:others];
+
+    // 无变化时原样返回（避免无谓重建）
+    BOOL changed = (sorted.count != children.count);
+    if (!changed) {
+        for (NSUInteger i = 0; i < children.count; i++) {
+            if (children[i] != sorted[i]) { changed = YES; break; }
         }
     }
     if (!changed) return menu;
-    return [menuCls performSelector:@selector(menuWithChildren:) withObject:keep];
-}
-
-// v1.3.6：UIMenuController 路径（QQ 单击输入框弹出的菜单疑似走老 API UIMenuController，而非
-// iOS16 UIEditMenuInteraction——v1.3.5 实测 editMenuInteraction: 不触发）。自定义项（换行/全屏输入）
-// 通过 setMenuItems: 设置，这里按 action 白名单过滤：只留 粘贴/复制/全选，其余（换行/全屏输入等）丢弃。
-static NSArray *chatmenu_filterMenuItems(NSArray *items) {
-    if (!items) return items;
-    NSMutableArray *keep = [NSMutableArray array];
-    for (id item in items) {
-        SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
-        if (chatmenu_isAllowedAction(a)) {
-            [keep addObject:item];
-        } else {
-            chatmenu_log([NSString stringWithFormat:@"[ucMenu] drop item action=%@",
-                          NSStringFromSelector(a)]);
-        }
-    }
-    return keep;
+    return [menuCls performSelector:@selector(menuWithChildren:) withObject:sorted];
 }
 
 static void chatswipe_loadConfig() {
@@ -116,249 +127,6 @@ static void chatswipe_loadConfig() {
             if ([cfg objectForKey:@"MenuFilterEnabled"]) gMenuFilterEnabled = [[cfg objectForKey:@"MenuFilterEnabled"] boolValue];
         }
     } @catch (id e) {}
-}
-
-// ==================== 懒加载子类 editMenuInteraction hook（v1.3.1 新增，替代 v1.2.8 的 %ctor 枚举） ====================
-// 机制：基类 canPerformAction: 触发时（交互期）→ 对 self 真实类做一次性 MSHookMessageEx hook editMenuInteraction。
-//   - 只 hook App 自己的类（isAppClass 排除系统/框架）
-//   - 只 hook 自身 override 了 editMenuInteraction: 的（未 override 的走基类 hook 已处理）
-//   - gEditMenuHookedClasses 去重；gEditMenuOrig 按类名存 orig（superclass 链兼容 KVO 子类）
-//   - 不 hook 子类 canPerformAction（避免启动期高频调 replacement 的隐患）
-//   - 时机：交互期（输入框显示 + 用户操作），非 %ctor 启动敏感期
-static NSMutableSet *gEditMenuHookedClasses = nil; // 已检查/已 hook 的类名（无论结果）
-static NSMutableDictionary *gEditMenuOrig = nil;   // key=NSStringFromClass, value=NSValue(IMP)
-static NSMutableDictionary *gTextMenuOrig = nil;   // key=NSStringFromClass, value=NSValue(IMP)  textView:editMenuForTextRange 的 orig
-
-// 前向声明：replacement 在 chatmenu_hookEditMenuForClassIfNeeded 中被引用
-static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested);
-
-static BOOL chatmenu_classOverridesSelector(Class cls, SEL sel) {
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(cls, &n);
-    BOOL found = NO;
-    for (unsigned i = 0; i < n; i++) {
-        if (method_getName(ms[i]) == sel) { found = YES; break; }
-    }
-    if (ms) free(ms);
-    return found;
-}
-
-// 只 hook App 自己的类（主可执行文件 / App 内嵌 framework），跳过 UIKit 等系统/rootless 框架内部类。
-static BOOL chatmenu_isAppClass(Class cls) {
-    if (!cls) return NO;
-    const char *img = class_getImageName(cls);
-    if (!img || !*img) {
-        // 动态生成的类（运行时创建、无 image）：QQ 的输入框 delegate 是 *_qlvr_obj_hook_* 运行时包装类，
-        // v1.3.3 把它误判成 system 跳过 → 过滤失效（换行/全屏输入残留）。动态类一律视为 App 类放行；
-        // 后续 classOverridesSelector 只会命中真正 override 目标方法的类，不会误伤。
-        return YES;
-    }
-    NSString *path = [NSString stringWithUTF8String:img];
-    if ([path hasPrefix:@"/System/Library/"]) return NO;
-    if ([path hasPrefix:@"/Library/"])        return NO;
-    if ([path hasPrefix:@"/usr/"])            return NO;
-    if ([path hasPrefix:@"/var/jb/Library/"]) return NO;
-    if ([path hasPrefix:@"/var/jb/usr/"])     return NO;
-    if ([path hasPrefix:@"/Applications/"])   return NO;
-    return YES; // /var/containers/.../App.app 或 App 内嵌 Frameworks
-}
-
-// replacement（C 函数，MSHookMessageEx 用，PAC 安全）
-// ⚠️ 严禁对 interaction 调未确认存在的 selector（如 interaction.view）—— UIEditMenuInteraction 无 view 方法，
-//    直接 objc_msgSend 会 unrecognized selector 闪退（v1.2.1/v1.2.4 教训）。
-//    改用 configuration 的 sourceView / editView 全程 respondsToSelector + objc_msgSend + @try/@catch 判定输入框菜单。
-static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested) {
-    IMP orig = NULL;
-    // superclass 链回查 orig（兼容 KVO 子类：实例 class 是 NSKVONotifying_XXX）
-    Class c = object_getClass(self);
-    while (c) {
-        NSValue *v = [gEditMenuOrig objectForKey:NSStringFromClass(c)];
-        if (v) { orig = (IMP)[v pointerValue]; break; }
-        c = class_getSuperclass(c);
-    }
-    if (!orig) return nil;
-    id menu = nil;
-    @try { menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, _cmd, interaction, config, suggested); }
-    @catch (id e) { return nil; }
-    if (!menu) return menu;
-    // 只过滤"关联输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
-    BOOL isTextInputMenu = NO;
-    @try {
-        if (config && [config respondsToSelector:@selector(editView)]) {
-            id src = ((id (*)(id, SEL))objc_msgSend)(config, @selector(editView));
-            if (src && ([src isKindOfClass:[UITextView class]] || [src isKindOfClass:[UITextField class]])) isTextInputMenu = YES;
-        }
-        if (!isTextInputMenu && config && [config respondsToSelector:@selector(sourceView)]) {
-            id src = ((id (*)(id, SEL))objc_msgSend)(config, @selector(sourceView));
-            if (src && ([src isKindOfClass:[UITextView class]] || [src isKindOfClass:[UITextField class]])) isTextInputMenu = YES;
-        }
-    } @catch (id e) {}
-    if (isTextInputMenu) {
-        @try { return chatmenu_filterMenu(menu); } @catch (id e) { return menu; }
-    }
-    return menu;
-}
-
-static void chatmenu_hookEditMenuForClassIfNeeded(Class cls) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        gEditMenuHookedClasses = [NSMutableSet set];
-        gEditMenuOrig = [NSMutableDictionary dictionary];
-        gTextMenuOrig = [NSMutableDictionary dictionary];
-    });
-    if (!cls) return;
-    NSString *key = NSStringFromClass(cls);
-    if ([gEditMenuHookedClasses containsObject:key]) return;  // 已检查/已 hook，跳过
-    [gEditMenuHookedClasses addObject:key];                    // 先标记，防重入
-    if (!chatmenu_isAppClass(cls)) {
-        chatmenu_log([NSString stringWithFormat:@"[editMenu] skip system class=%@", key]);
-        return;
-    }
-    SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
-    if (!chatmenu_classOverridesSelector(cls, editSel)) {
-        chatmenu_log([NSString stringWithFormat:@"[editMenu] skip not-override class=%@", key]);
-        return; // 未 override → 走基类 hook 已处理
-    }
-    IMP orig = NULL;
-    MSHookMessageEx(cls, editSel, (IMP)chatmenu_editMenuReplacement, &orig);  // PAC 安全
-    if (orig) {
-        [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
-    }
-    chatmenu_log([NSString stringWithFormat:@"[editMenu] hooked class=%@ orig=%@", key, orig ? @"YES" : @"NO"]);
-}
-
-// v1.3.3：App 自定义菜单项的标准注入点是 UITextViewDelegate 的
-//   textView:editMenuForTextRange:suggestedActions:（iOS16 新增，静态确认 QQ 二进制含此 selector）。
-//   该方法的实现者是【输入框的 delegate】（App 的 VC/controller），且 delegate 类通常 override 了它，
-//   所以 NSObject 基类 hook 会被绕过（v1.3.2 实测 [textMenu] 日志不出现）。
-//   正解：在 canPerformAction: 触发时拿到输入框的 delegate，对【那个具体 App 类】MSHookMessageEx
-//   hook textView:editMenuForTextRange:suggestedActions:，过滤返回的 suggestedActions 数组。
-
-// textView:editMenuForTextRange:suggestedActions: 的 replacement（C 函数，PAC 安全）
-static id chatmenu_textMenuReplacement(id self, SEL _cmd, id textView, id range, id suggestedActions) {
-    IMP orig = NULL;
-    Class c = object_getClass(self);
-    while (c) {
-        NSValue *v = [gTextMenuOrig objectForKey:NSStringFromClass(c)];
-        if (v) { orig = (IMP)[v pointerValue]; break; }
-        c = class_getSuperclass(c);
-    }
-    if (!orig) return suggestedActions;
-    id arr = nil;
-    @try { arr = ((id (*)(id, SEL, id, id, id))orig)(self, _cmd, textView, range, suggestedActions); }
-    @catch (id e) { return suggestedActions; }
-    if (!arr || ![arr isKindOfClass:[NSArray class]]) return arr;
-    NSArray *src = (NSArray *)arr;
-    NSMutableArray *keep = [NSMutableArray array];
-    Class cmdCls = NSClassFromString(@"UICommand");
-    Class actionCls = NSClassFromString(@"UIAction");
-    for (id el in src) {
-        if (cmdCls && [el isKindOfClass:cmdCls]) {
-            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
-        } else if (actionCls && [el isKindOfClass:actionCls]) {
-            // App 自定义 UIAction：丢弃
-        } else {
-            [keep addObject:el];
-        }
-    }
-    if (keep.count != src.count) {
-        chatmenu_log([NSString stringWithFormat:@"[textMenu] filtered %lu -> %lu",
-                      (unsigned long)src.count, (unsigned long)keep.count]);
-        return keep;
-    }
-    return arr;
-}
-
-static void chatmenu_hookTextMenuDelegateIfNeeded(id input) {
-    if (!gMenuFilterEnabled || !input) return;
-    id delegate = nil;
-    @try {
-        if ([input respondsToSelector:@selector(delegate)]) {
-            delegate = ((id (*)(id, SEL))objc_msgSend)(input, @selector(delegate));
-        }
-    } @catch (id e) {}
-    if (!delegate) return;
-    Class dcls = object_getClass(delegate);
-    if (!dcls) return;
-    NSString *key = [NSString stringWithFormat:@"textmenu_%@", NSStringFromClass(dcls)];
-    if ([gEditMenuHookedClasses containsObject:key]) return;
-    [gEditMenuHookedClasses addObject:key]; // 先标记，防重入
-    if (!chatmenu_isAppClass(dcls)) {
-        chatmenu_log([NSString stringWithFormat:@"[textMenu] skip system delegate=%@", NSStringFromClass(dcls)]);
-        return;
-    }
-    // 1) 若 delegate 类 override 了 textView:editMenuForTextRange:suggestedActions: → hook 过滤；
-    //    未 override → 跳过（不 return，继续下面 editMenuInteraction: 检查 —— v1.3.6 return bug 修复）。
-    SEL sel = @selector(textView:editMenuForTextRange:suggestedActions:);
-    if (chatmenu_classOverridesSelector(dcls, sel)) {
-        IMP orig = NULL;
-        MSHookMessageEx(dcls, sel, (IMP)chatmenu_textMenuReplacement, &orig);  // PAC 安全
-        if (orig) {
-            [gTextMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(dcls)];
-        }
-        chatmenu_log([NSString stringWithFormat:@"[textMenu] hooked delegate=%@ orig=%@",
-                      NSStringFromClass(dcls), orig ? @"YES" : @"NO"]);
-    } else {
-        chatmenu_log([NSString stringWithFormat:@"[textMenu] skip not-override delegate=%@", NSStringFromClass(dcls)]);
-    }
-
-    // 2) delegate 类若 override 了 editMenuInteraction:（QQ 菜单 delegate 走这一层而非
-    //    textView:editMenuForTextRange:，v1.3.4 实测 not-override 已证明）→ hook 过滤。
-    SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
-    if (chatmenu_classOverridesSelector(dcls, editSel)) {
-        NSString *k2 = [NSString stringWithFormat:@"editdelegate_%@", NSStringFromClass(dcls)];
-        if (![gEditMenuHookedClasses containsObject:k2]) {
-            [gEditMenuHookedClasses addObject:k2];
-            IMP eorig = NULL;
-            MSHookMessageEx(dcls, editSel, (IMP)chatmenu_editMenuReplacement, &eorig);  // PAC 安全
-            if (eorig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)eorig] forKey:NSStringFromClass(dcls)];
-            chatmenu_log([NSString stringWithFormat:@"[delegateMenu] hooked delegate=%@ orig=%@",
-                          NSStringFromClass(dcls), eorig ? @"YES" : @"NO"]);
-        }
-    } else {
-        chatmenu_log([NSString stringWithFormat:@"[delegateMenu] skip not-override delegate=%@", NSStringFromClass(dcls)]);
-    }
-}
-
-// v1.3.7：交互期"按需枚举"兜底——canPerformAction 首次触发时扫描所有已注册类，对
-// "App 类（含动态类）+ 自身实现了 editMenuInteraction:" 的类 MSHookMessageEx hook。
-// 覆盖菜单 delegate 是任意 App 类（含 QQ 运行时动态包装类 *_qlvr_obj_hook_*）的场景；
-// 交互期执行 + isAppClass 限定 + 只 hook 低频的 editMenuInteraction:，
-// 远优于 v1.2.8 的 %ctor 同步枚举（闪退根源：扫系统类 + 启动敏感期 + hook canPerformAction 高频方法）。
-static void chatmenu_hookAllEditMenuClassesIfNeeded() {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        gEditMenuHookedClasses = [NSMutableSet set];
-        gEditMenuOrig = [NSMutableDictionary dictionary];
-    });
-    static BOOL sScanned = NO;
-    if (sScanned) return;
-    sScanned = YES;
-    SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)count);
-    if (!classes) return;
-    count = objc_getClassList(classes, count);
-    int hooked = 0;
-    for (int i = 0; i < count; i++) {
-        Class cls = classes[i];
-        if (!cls) continue;
-        if (!chatmenu_classOverridesSelector(cls, editSel)) continue; // 仅自身实现的类
-        if (!chatmenu_isAppClass(cls)) continue;                       // 含动态类放行
-        NSString *key = [NSString stringWithFormat:@"enumm_%s", class_getName(cls)];
-        if ([gEditMenuHookedClasses containsObject:key]) continue;
-        [gEditMenuHookedClasses addObject:key];
-        IMP orig = NULL;
-        MSHookMessageEx(cls, editSel, (IMP)chatmenu_editMenuReplacement, &orig);  // PAC 安全
-        if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(cls)];
-        chatmenu_log([NSString stringWithFormat:@"[enumMenu] hooked class=%s orig=%@",
-                      class_getName(cls), orig ? @"YES" : @"NO"]);
-        hooked++;
-    }
-    free(classes);
-    chatmenu_log([NSString stringWithFormat:@"[enumMenu] scan done hooked=%d", hooked]);
 }
 
 // ==================== 共享 pan delegate：允许与原生文本选择手势并存 ====================
@@ -454,245 +222,11 @@ static void chatswipe_paste(UIView *view) {
 }
 @end
 
-// ==================== 编辑菜单精简 Hook（编译期 %hook + 懒加载子类 hook，PAC 安全） ====================
-// 基类 hook（Logos 编译期）：
-//   1) canPerformAction:withSender: —— 三件套强制 YES（顺手懒加载子类 editMenu hook），其余 NO（含 scanDocument 扫描文本）。
-//   2) editMenuInteraction:menuForConfiguration:suggestedActions: —— 对直接基类实例的 UIMenu 递归过滤。
-//   3) buildMenuWithBuilder: —— iOS 13–15 旧路径兜底（UIMenuController + UIMenuBuilder）。
-// 懒加载子类 hook（MSHookMessageEx，PAC 安全，交互期一次性）：
-//   在 canPerformAction: 触发时，chatmenu_hookEditMenuForClassIfNeeded 对 self 真实类做 hook editMenuInteraction:，
-//   删掉子类 App 自定义项（QQ 换行/全屏输入、微信 #话题/搜一搜 等）。
-//
-// 新增（v1.3.2）：App 自定义菜单项的标准注入点是 UITextViewDelegate 的
-//   textView:editMenuForTextRange:suggestedActions:（iOS16 新增，静态确认 QQ 二进制含此 selector）。
-//   全局 %hook NSObject 拦截该方法，过滤返回的 suggestedActions 数组（保留白名单 UICommand，
-//   丢弃 UIAction 与其余项）→ 从源头挡掉 换行/全屏输入/#话题/搜一搜 等 App 自定义项（QQ/TG/微信 通用）。
-//   注：若 App delegate 自身 override 了该方法，NSObject 基类 hook 会被绕过 → 由下面
-//   editMenuInteraction: 过滤 + 懒加载子类 hook 兜底；本块同时带诊断日志确认触发情况。
-%hook NSObject
-- (id)textView:(id)textView editMenuForTextRange:(id)range suggestedActions:(id)suggestedActions {
-    id orig = %orig;
-    if (!gMenuFilterEnabled) return orig;
-    if (!textView || !suggestedActions || ![suggestedActions isKindOfClass:[NSArray class]]) return orig;
-    @try {
-        NSArray *arr = (NSArray *)suggestedActions;
-        chatmenu_log([NSString stringWithFormat:@"[textMenu] delegate=%@ textView=%@ count=%lu",
-                      NSStringFromClass([self class]), NSStringFromClass([textView class]),
-                      (unsigned long)arr.count]);
-        NSMutableArray *keep = [NSMutableArray array];
-        Class cmdCls = NSClassFromString(@"UICommand");
-        Class actionCls = NSClassFromString(@"UIAction");
-        for (id el in arr) {
-            if (cmdCls && [el isKindOfClass:cmdCls]) {
-                SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                if (chatmenu_isAllowedAction(a)) { [keep addObject:el]; }
-            } else if (actionCls && [el isKindOfClass:actionCls]) {
-                // App 自定义 UIAction：丢弃
-            } else {
-                [keep addObject:el];
-            }
-        }
-        if (keep.count != arr.count) {
-            chatmenu_log([NSString stringWithFormat:@"[textMenu] filtered %lu -> %lu",
-                          (unsigned long)arr.count, (unsigned long)keep.count]);
-            return keep;
-        }
-        return arr;
-    } @catch (id e) { return orig; }
-}
-
-// v1.3.5：全局拦截 editMenuInteraction:menuForConfiguration:suggestedActions:（iOS16 菜单生成核心入口）。
-// 日志确认 self=谁在实现（输入框 / coordinator / VC），并只对"关联输入框"的菜单过滤
-//（config.sourceView/editView 判定，全程 respondsToSelector + objc_msgSend + try/catch），
-// 其他菜单（图片/链接长按等）原样放行，避免误伤。
-- (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
-    id result = %orig;
-    if (!gMenuFilterEnabled) return result;
-    @try {
-        BOOL isInput = NO;
-        if (configuration && [configuration respondsToSelector:@selector(editView)]) {
-            id v = ((id (*)(id, SEL))objc_msgSend)(configuration, @selector(editView));
-            if (v && ([v isKindOfClass:[UITextView class]] || [v isKindOfClass:[UITextField class]])) isInput = YES;
-        }
-        if (!isInput && configuration && [configuration respondsToSelector:@selector(sourceView)]) {
-            id v = ((id (*)(id, SEL))objc_msgSend)(configuration, @selector(sourceView));
-            if (v && ([v isKindOfClass:[UITextView class]] || [v isKindOfClass:[UITextField class]])) isInput = YES;
-        }
-        chatmenu_log([NSString stringWithFormat:@"[nsmenu] self=%@ isInput=%d",
-                      NSStringFromClass([self class]), isInput]);
-        Class menuCls = NSClassFromString(@"UIMenu");
-        if (isInput && menuCls && [result isKindOfClass:menuCls]) {
-            NSArray *ch = [result valueForKey:@"children"];
-            chatmenu_log([NSString stringWithFormat:@"[nsmenu] children=%lu", (unsigned long)ch.count]);
-            for (id el in ch) {
-                NSString *extra = @"";
-                if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
-                if ([el isKindOfClass:NSClassFromString(@"UICommand")]) {
-                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                    extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
-                }
-                chatmenu_log([NSString stringWithFormat:@"[nsmenu]  - %@ %@", [el class], extra]);
-            }
-        }
-        if (isInput) return chatmenu_filterMenu(result);
-    } @catch (id e) {}
-    return result;
-}
-%end
-
-// v1.3.6：UIMenuController（老 API，单击输入框聚焦弹菜单的自定义项走这里）。
-// 过滤 setMenuItems: 传入的自定义项（换行/全屏输入等），粘贴/复制/全选由系统按 canPerformAction 显示（已 hook）。
-%hook UIMenuController
-- (void)setMenuItems:(NSArray *)items {
-    if (gMenuFilterEnabled) {
-        @try {
-            NSArray *filtered = chatmenu_filterMenuItems(items);
-            if (filtered && filtered.count != items.count) {
-                chatmenu_log([NSString stringWithFormat:@"[ucMenu] setMenuItems %lu -> %lu",
-                              (unsigned long)items.count, (unsigned long)filtered.count]);
-                items = filtered; // 改局部变量，%orig 会用过滤后的数组（避免 %orig(带参) 的 Logos 展开坑）
-            }
-        } @catch (id e) {}
-    }
-    %orig;
-}
-
-// v1.4.0：v1.3.9 探测实锤——QQ 的"换行/全屏输入"是 UIMenuItem（initWithTitle:action: 被调，
-// action=MenuWrapWithSender: / allScreenInputWithSender:），但显示时走 menuItems GETTER 读取
-//（不走 setMenuItems: setter，故 v1.3.6 只 hook setter 拦不到）。这里在 getter 过滤非白名单项。
-- (NSArray *)menuItems {
-    NSArray *items = %orig;
-    if (gMenuFilterEnabled && items && items.count > 0) {
-        @try {
-            NSMutableArray *keep = [NSMutableArray array];
-            for (id item in items) {
-                SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
-                if (chatmenu_isAllowedAction(a)) {
-                    [keep addObject:item];
-                } else {
-                    chatmenu_log([NSString stringWithFormat:@"[ucMenu-getter] drop title=%@ action=%@",
-                                  [item valueForKey:@"title"] ?: @"", NSStringFromSelector(a)]);
-                }
-            }
-            if (keep.count != items.count) {
-                chatmenu_log([NSString stringWithFormat:@"[ucMenu-getter] filtered %lu -> %lu",
-                              (unsigned long)items.count, (unsigned long)keep.count]);
-                return keep;
-            }
-        } @catch (id e) {}
-    }
-    return items;
-}
-
-// v1.4.1：QQ 创建 UIMenuItem 但不走 setMenuItems:/menuItems getter（私有路径直接改 ivar）。
-// 显示前（setMenuVisible:animated: / update）通过 KVC 过滤私有 ivar _menuItems 中的非白名单项。
-- (void)setMenuVisible:(BOOL)visible animated:(BOOL)animated {
-    if (gMenuFilterEnabled && visible) {
-        @try {
-            NSArray *items = [self valueForKey:@"_menuItems"];
-            if (items && items.count > 0) {
-                NSMutableArray *keep = [NSMutableArray array];
-                for (id item in items) {
-                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
-                    if (chatmenu_isAllowedAction(a)) {
-                        [keep addObject:item];
-                    } else {
-                        chatmenu_log([NSString stringWithFormat:@"[ucVisible] drop title=%@ action=%@",
-                                      [item valueForKey:@"title"] ?: @"", NSStringFromSelector(a)]);
-                    }
-                }
-                if (keep.count != items.count) {
-                    [self setValue:keep forKey:@"_menuItems"];
-                    chatmenu_log([NSString stringWithFormat:@"[ucVisible] filtered %lu -> %lu",
-                                  (unsigned long)items.count, (unsigned long)keep.count]);
-                }
-            }
-        } @catch (id e) {}
-    }
-    %orig;
-}
-- (void)update {
-    if (gMenuFilterEnabled) {
-        @try {
-            NSArray *items = [self valueForKey:@"_menuItems"];
-            if (items && items.count > 0) {
-                NSMutableArray *keep = [NSMutableArray array];
-                for (id item in items) {
-                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
-                    if (chatmenu_isAllowedAction(a)) {
-                        [keep addObject:item];
-                    } else {
-                        chatmenu_log([NSString stringWithFormat:@"[ucUpdate] drop title=%@ action=%@",
-                                      [item valueForKey:@"title"] ?: @"", NSStringFromSelector(a)]);
-                    }
-                }
-                if (keep.count != items.count) {
-                    [self setValue:keep forKey:@"_menuItems"];
-                    chatmenu_log([NSString stringWithFormat:@"[ucUpdate] filtered %lu -> %lu",
-                                  (unsigned long)items.count, (unsigned long)keep.count]);
-                }
-            }
-        } @catch (id e) {}
-    }
-    %orig;
-}
-%end
-
-// ==================== v1.3.9 运行时探测（QQ 自绘菜单定位） ====================
-// QQ 加密 + 自绘菜单：frida attach 被拒（incompatible Mach-O image），改用 dylib 自探。
-// hook UIButton.setTitle / UIMenuItem / didMoveToWindow / presentViewController，
-// 老板单击输入框后日志直接暴露菜单按钮 title/类/action，据此写精准过滤。
-%hook UIButton
-- (void)setTitle:(NSString *)title forState:(UIControlState)state {
-    %orig;
-    if (gMenuFilterEnabled && title.length > 0) {
-        @try {
-            if ([title containsString:@"换行"] || [title containsString:@"全屏"] ||
-                [title containsString:@"拷贝"] || [title containsString:@"粘贴"] ||
-                [title containsString:@"全选"] || [title containsString:@"复制"]) {
-                chatmenu_log([NSString stringWithFormat:@"[btn] setTitle=%@ class=%@", title, NSStringFromClass([self class])]);
-            }
-        } @catch (id e) {}
-    }
-}
-%end
-
-%hook UIMenuItem
-- (instancetype)initWithTitle:(NSString *)title action:(SEL)action {
-    id r = %orig;
-    if (gMenuFilterEnabled) {
-        @try {
-            chatmenu_log([NSString stringWithFormat:@"[uItem] init title=%@ action=%@", title, NSStringFromSelector(action)]);
-        } @catch (id e) {}
-    }
-    return r;
-}
-%end
-
-%hook UIView
-- (void)didMoveToWindow {
-    %orig;
-    if (gMenuFilterEnabled && self.window) {
-        static int sCnt = 0;
-        if (sCnt < 300) {
-            sCnt++;
-            chatmenu_log([NSString stringWithFormat:@"[view] %@ (super=%@)", NSStringFromClass([self class]), NSStringFromClass([[self superview] class])]);
-        }
-    }
-}
-%end
-
-%hook UIViewController
-- (void)presentViewController:(UIViewController *)vcToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
-    %orig;
-    if (gMenuFilterEnabled) {
-        @try {
-            chatmenu_log([NSString stringWithFormat:@"[present] %@ -> %@", NSStringFromClass([self class]), NSStringFromClass([vcToPresent class])]);
-        } @catch (id e) {}
-    }
-}
-%end
-
+// ==================== 编辑菜单三件套 Hook（编译期 %hook，PAC 安全） ====================
+// 1) canPerformAction: —— 三件套强制 YES，其余 NO（含 scanDocument 扫描文本/剪切/选择/替换/查找/翻译）
+// 2) editMenuInteraction: —— iOS16 对最终 UIMenu 过滤 + 排序（全选→复制→粘贴）
+// 3) UIEditMenuInteraction updateVisibleMenu —— iOS16 系统菜单显示/更新时 KVC 过滤排序（兜底系统路径）
+// 4) buildMenuWithBuilder: —— iOS 13–15 旧路径兜底
 %hook UITextView
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
@@ -705,53 +239,17 @@ static void chatswipe_paste(UIView *view) {
     if (self.window) chatswipe_attachIfNeeded(self);
 }
 
-// v1.3.8：QQ 的"换行/全屏输入"若挂在键盘辅助条（inputAssistantItem）上则清空其按钮组。
-- (id)inputAssistantItem {
-    id item = %orig;
-    if (gMenuFilterEnabled && item) {
-        @try {
-            [item setValue:@[] forKey:@"leadingBarButtonGroups"];
-            [item setValue:@[] forKey:@"trailingBarButtonGroups"];
-            chatmenu_log(@"[assist] cleared");
-        } @catch (id e) {}
-    }
-    return item;
-}
-
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
-    if (chatmenu_isAllowedAction(action)) {
-        // 懒加载 hook 该输入框真实类的 editMenuInteraction（删子类 App 自定义项：换行/全屏输入 等）
-        chatmenu_hookEditMenuForClassIfNeeded(object_getClass(self));
-        chatmenu_hookTextMenuDelegateIfNeeded(self);
-        chatmenu_hookAllEditMenuClassesIfNeeded();
-        return YES; // 三件套：强制显示 + 可用
-    }
-    return NO; // 其余（含 scanDocument 扫描文本）一律不显示
+    if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
+    return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
 }
 
-// iOS 16 主拦截点（基类实例 + 子类未 override 的情形）：对最终 UIMenu 递归过滤。
+// iOS 16 主拦截点（基类实例 + 子类未 override 的情形）：过滤 + 排序。
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
     id origMenu = %orig;
-    @try {
-        Class menuCls = NSClassFromString(@"UIMenu");
-        if (menuCls && [origMenu isKindOfClass:menuCls]) {
-            NSArray *ch = [origMenu valueForKey:@"children"];
-            chatmenu_log([NSString stringWithFormat:@"[menu] self=%@ children=%lu",
-                          NSStringFromClass([self class]), (unsigned long)ch.count]);
-            for (id el in ch) {
-                NSString *extra = @"";
-                if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
-                if ([el isKindOfClass:NSClassFromString(@"UICommand")]) {
-                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                    extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
-                }
-                chatmenu_log([NSString stringWithFormat:@"[menu]  - %@ %@", [el class], extra]);
-            }
-        }
-    } @catch (id e) {}
-    return chatmenu_filterMenu(origMenu);
+    return chatmenu_filterAndOrderMenu(origMenu);
 }
 
 // 兜底：iOS 13–15 旧路径（UIMenuController + UIMenuBuilder）。
@@ -794,53 +292,18 @@ static void chatswipe_paste(UIView *view) {
     if (self.window) chatswipe_attachIfNeeded(self);
 }
 
-// v1.3.8：QQ 的"换行/全屏输入"若挂在键盘辅助条（inputAssistantItem）上则清空其按钮组。
-- (id)inputAssistantItem {
-    id item = %orig;
-    if (gMenuFilterEnabled && item) {
-        @try {
-            [item setValue:@[] forKey:@"leadingBarButtonGroups"];
-            [item setValue:@[] forKey:@"trailingBarButtonGroups"];
-            chatmenu_log(@"[assist] cleared");
-        } @catch (id e) {}
-    }
-    return item;
-}
-
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
     // 密码框不强制 复制/全选（防泄密），但 粘贴 仍允许
     if ((action == @selector(copy:) || action == @selector(selectAll:)) && self.secureTextEntry) return %orig;
-    if (chatmenu_isAllowedAction(action)) {
-        chatmenu_hookEditMenuForClassIfNeeded(object_getClass(self));
-        chatmenu_hookTextMenuDelegateIfNeeded(self);
-        chatmenu_hookAllEditMenuClassesIfNeeded();
-        return YES; // 三件套：强制显示 + 可用
-    }
-    return NO; // 其余（含 scanDocument 扫描文本）一律不显示
+    if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
+    return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
 }
 
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
     id origMenu = %orig;
-    @try {
-        Class menuCls = NSClassFromString(@"UIMenu");
-        if (menuCls && [origMenu isKindOfClass:menuCls]) {
-            NSArray *ch = [origMenu valueForKey:@"children"];
-            chatmenu_log([NSString stringWithFormat:@"[menu] self=%@ children=%lu",
-                          NSStringFromClass([self class]), (unsigned long)ch.count]);
-            for (id el in ch) {
-                NSString *extra = @"";
-                if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
-                if ([el isKindOfClass:NSClassFromString(@"UICommand")]) {
-                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                    extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
-                }
-                chatmenu_log([NSString stringWithFormat:@"[menu]  - %@ %@", [el class], extra]);
-            }
-        }
-    } @catch (id e) {}
-    return chatmenu_filterMenu(origMenu);
+    return chatmenu_filterAndOrderMenu(origMenu);
 }
 
 - (void)buildMenuWithBuilder:(id)builder {
@@ -871,6 +334,35 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
+// v1.5.0：iOS16 系统菜单（UIEditMenuInteraction）显示/更新时，KVC 过滤排序 _menu。
+// 只处理"含文本编辑白名单项"的菜单（避免误伤图片/链接长按等）；_menu 私有 ivar 取不到则自动跳过。
+%hook UIEditMenuInteraction
+- (void)updateVisibleMenu {
+    %orig;
+    if (!gMenuFilterEnabled) return;
+    @try {
+        id menu = [self valueForKey:@"_menu"];
+        if (!menu) return;
+        // 只处理含白名单项的菜单（文本编辑菜单），其他菜单原样放行
+        BOOL hasWhitelist = NO;
+        Class cmdCls = NSClassFromString(@"UICommand");
+        NSArray *ch = [menu valueForKey:@"children"];
+        for (id el in ch) {
+            if (cmdCls && [el isKindOfClass:cmdCls]) {
+                SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                if (chatmenu_isAllowedAction(a)) { hasWhitelist = YES; break; }
+            }
+        }
+        if (!hasWhitelist) return;
+        id filtered = chatmenu_filterAndOrderMenu(menu);
+        if (filtered != menu) {
+            [self setValue:filtered forKey:@"_menu"];
+            chatmenu_log(@"[editMenuUpdate] filtered+ordered");
+        }
+    } @catch (id e) {}
+}
+%end
+
 %ctor {
     chatswipe_loadConfig();
     // 清除上一版本日志 + 写加载标记（写 App 沙盒 Documents，SSH 可 cat：
@@ -880,6 +372,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.4.1 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.0 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
