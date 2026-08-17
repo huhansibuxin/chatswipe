@@ -34,7 +34,9 @@ static SEL gSelPaste      = nil;
 
 // ==================== 现代路径 delegate hook 状态 ====================
 static NSMutableDictionary *gEditMenuOrig = nil; // 按类名存 delegate 原 editMenuInteraction IMP
-static NSMutableSet *gEditMenuHooked = nil;      // 已 hook 的 delegate 类（去重）
+static NSMutableSet *gEditMenuHooked = nil;
+static NSMutableDictionary *gTextMenuOrig = nil; // 按类名存 delegate 原 textView:editMenuForTextRange: IMP
+static NSMutableSet *gTextMenuHooked = nil;
 
 // ==================== 诊断日志（写 App 沙盒 Documents，%ctor 先清空） ====================
 static void chatmenu_log(NSString *msg) {
@@ -165,7 +167,66 @@ static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id con
         origMenu = fn(&sup, _cmd, interaction, config, suggested);
     }
     if (!gMenuFilterEnabled) return origMenu;
+    chatmenu_log([NSString stringWithFormat:@"[emi] replacement hit self=%@ menu=%@",
+                  NSStringFromClass(cls), origMenu ? @"nonnil" : @"nil"]);
     return chatmenu_filterAndOrderMenu(origMenu);
+}
+
+// 文本视图 delegate 路径 replacement：textView:editMenuForTextRange:suggestedActions:
+// iOS16 文本视图 delegate 可在此返回 UIMenu（菜单内容与顺序由它决定）→ 过滤 + 排序。
+static id chatmenu_textMenuReplacement(id self, SEL _cmd, id tv, id range, NSArray *suggested) {
+    Class cls = object_getClass(self);
+    IMP orig = NULL;
+    Class sc = cls;
+    while (sc) {
+        NSValue *v = [gTextMenuOrig objectForKey:NSStringFromClass(sc)];
+        if (v) { orig = (IMP)[v pointerValue]; break; }
+        sc = class_getSuperclass(sc);
+    }
+    id origMenu = nil;
+    if (orig) {
+        id (*fn)(id, SEL, id, id, NSArray *) = (id (*)(id, SEL, id, id, NSArray *))orig;
+        origMenu = fn(self, _cmd, tv, range, suggested);
+    } else {
+        struct objc_super sup = { self, class_getSuperclass(cls) };
+        id (*fn)(struct objc_super *, SEL, id, id, NSArray *) =
+            (id (*)(struct objc_super *, SEL, id, id, NSArray *))objc_msgSendSuper;
+        origMenu = fn(&sup, _cmd, tv, range, suggested);
+    }
+    if (!gMenuFilterEnabled) return origMenu;
+    chatmenu_log([NSString stringWithFormat:@"[tvEditMenu] hit self=%@ menu=%@",
+                  NSStringFromClass(cls), origMenu ? @"nonnil" : @"nil"]);
+    if (origMenu) return chatmenu_filterAndOrderMenu(origMenu);
+    // orig 返回 nil → UIKit 用 suggestedActions 自建菜单；我们从中过滤+排序白名单项后组 UIMenu。
+    if (suggested && suggested.count) {
+        Class cmdCls = NSClassFromString(@"UICommand");
+        Class actCls = NSClassFromString(@"UIAction");
+        NSMutableArray *keep = [NSMutableArray array];
+        for (id a in suggested) {
+            if (cmdCls && [a isKindOfClass:cmdCls]) {
+                SEL act = ((SEL (*)(id, SEL))objc_msgSend)(a, @selector(action));
+                if (chatmenu_isAllowedAction(act)) [keep addObject:a];
+            } else if (actCls && [a isKindOfClass:actCls]) {
+                // App 自定义 UIAction：丢弃
+            } else {
+                if (chatmenu_isAllowedAction(((SEL (*)(id, SEL))objc_msgSend)(a, @selector(action)))) [keep addObject:a];
+            }
+        }
+        NSArray *order = @[NSStringFromSelector(@selector(selectAll:)),
+                           NSStringFromSelector(@selector(copy:)),
+                           NSStringFromSelector(@selector(paste:))];
+        NSMutableArray *ordered = [NSMutableArray array];
+        for (NSString *sn in order) {
+            for (id a in keep) {
+                SEL act = ((SEL (*)(id, SEL))objc_msgSend)(a, @selector(action));
+                if ([NSStringFromSelector(act) isEqualToString:sn]) { [ordered addObject:a]; break; }
+            }
+        }
+        for (id a in keep) { if (![ordered containsObject:a]) [ordered addObject:a]; }
+        Class menuCls = NSClassFromString(@"UIMenu");
+        if (menuCls && ordered.count) return [menuCls performSelector:@selector(menuWithChildren:) withObject:ordered];
+    }
+    return nil;
 }
 
 // ==================== 共享 pan delegate ====================
@@ -273,6 +334,36 @@ static void chatswipe_paste(UIView *view) {
     if (self.window) { chatswipe_attachIfNeeded(self); if (self.isFirstResponder) gCurrentInput = self; }
 }
 
+// 捕获输入框真实 delegate 类，hook 其 textView:editMenuForTextRange:suggestedActions:（iOS16 决定菜单内容与顺序）。
+- (void)setDelegate:(id)delegate {
+    if (gMenuFilterEnabled && delegate && chatmenu_isAppClass([delegate class])) {
+        Class dcls = [delegate class];
+        NSString *key = NSStringFromClass(dcls);
+        if (![gTextMenuHooked containsObject:key]) {
+            [gTextMenuHooked addObject:key];
+            chatmenu_log([NSString stringWithFormat:@"[tvSetDelegate] %@ isInput=%d", key,
+                          ([delegate isKindOfClass:[UITextView class]]||[delegate isKindOfClass:[UITextField class]])?1:0]);
+            BOOL defines = NO;
+            unsigned int mc = 0;
+            Method *ml = class_copyMethodList(dcls, &mc);
+            for (unsigned int i = 0; i < mc; i++) {
+                if (method_getName(ml[i]) == @selector(textView:editMenuForTextRange:suggestedActions:)) { defines = YES; break; }
+            }
+            if (ml) free(ml);
+            if (defines) {
+                Method m = class_getInstanceMethod(dcls, @selector(textView:editMenuForTextRange:suggestedActions:));
+                IMP newImp = (IMP)chatmenu_textMenuReplacement;
+                IMP origImp = method_setImplementation(m, newImp);
+                if (origImp) [gTextMenuOrig setObject:[NSValue valueWithPointer:(void *)origImp] forKey:key];
+                chatmenu_log([NSString stringWithFormat:@"[tvEditMenu] hooked %@ orig=%d", key, origImp ? 1 : 0]);
+            } else {
+                chatmenu_log([NSString stringWithFormat:@"[tvEditMenu] skip not-override %@", key]);
+            }
+        }
+    }
+    %orig;
+}
+
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
     if (action == gSelSelectAll || action == gSelCopy || action == gSelPaste) return YES;
@@ -323,9 +414,14 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
-// ==================== 现代路径：捕获 UIEditMenuInteraction 真实 delegate 并 hook（QQ 实测走这条） ====================
+// ==================== 现代路径 A：UIEditMenuInteraction 的 delegate（部分 App） ====================
 %hook UIEditMenuInteraction
 - (void)setDelegate:(id)delegate {
+    if (gMenuFilterEnabled && delegate) {
+        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] called %@ isApp=%d isInput=%d",
+                      NSStringFromClass([delegate class]), chatmenu_isAppClass([delegate class]) ? 1 : 0,
+                      ([delegate isKindOfClass:[UITextView class]] || [delegate isKindOfClass:[UITextField class]]) ? 1 : 0]);
+    }
     if (gMenuFilterEnabled && delegate &&
         chatmenu_isAppClass([delegate class]) &&
         ![delegate isKindOfClass:[UITextView class]] &&
@@ -334,7 +430,6 @@ static void chatswipe_paste(UIView *view) {
         NSString *key = NSStringFromClass(dcls);
         if (![gEditMenuHooked containsObject:key]) {
             [gEditMenuHooked addObject:key];
-            // 仅当该类【自身】定义 editMenuInteraction: 才替换（避免改到父类影响全局）。
             BOOL defines = NO;
             unsigned int mc = 0;
             Method *mlist = class_copyMethodList(dcls, &mc);
@@ -400,6 +495,8 @@ static void chatswipe_paste(UIView *view) {
     gSelPaste      = NSSelectorFromString(@"chatswipe_paste:");
     gEditMenuOrig  = [NSMutableDictionary dictionary];
     gEditMenuHooked = [NSMutableSet set];
+    gTextMenuOrig  = [NSMutableDictionary dictionary];
+    gTextMenuHooked = [NSMutableSet set];
 
     chatswipe_loadConfig();
     @try {
