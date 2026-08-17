@@ -415,36 +415,42 @@ static void chatswipe_paste(UIView *view) {
 %end
 
 // ==================== 现代路径 A：UIEditMenuInteraction 的 delegate（部分 App） ====================
-// QQ 实测用 initWithDelegate: 设 delegate（setDelegate: 不会被调用），故两个入口都捕获。
+// QQ 实测用 initWithDelegate: 设 delegate（init 时即设，setDelegate: 不一定被调用），故两个入口都捕获。
+// 该 delegate 即 UIKit 用来构建编辑菜单的对象，其
+// editMenuInteraction:menuForConfiguration:suggestedActions: 返回 UIMenu（决定内容与顺序）。
+// 仅 hook App 类（PAC 安全）；系统类只记类名便于诊断；输入框本身（delegate=文本框）交给
+// %hook UITextView/UITextField 处理，避免双重 hook。
 static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
     if (!gMenuFilterEnabled || !delegate) return;
     Class dcls = [delegate class];
     NSString *key = NSStringFromClass(dcls);
     if ([gEditMenuHooked containsObject:key]) return;
     [gEditMenuHooked addObject:key];
-    chatmenu_log([NSString stringWithFormat:@"[emiDelegate] seen %@ isApp=%d isInput=%d",
-                  key, chatmenu_isAppClass(dcls) ? 1 : 0,
-                  ([delegate isKindOfClass:[UITextView class]] || [delegate isKindOfClass:[UITextField class]]) ? 1 : 0]);
-    if (!chatmenu_isAppClass(dcls) ||
-        [delegate isKindOfClass:[UITextView class]] ||
+    BOOL isApp = chatmenu_isAppClass(dcls);
+    chatmenu_log([NSString stringWithFormat:@"[emiDelegate] seen %@ isApp=%d", key, isApp ? 1 : 0]);
+    if (!isApp) return; // 系统类（UIKit 内部 assistant 等）→ 仅记录类名，后续按需 hook
+    if ([delegate isKindOfClass:[UITextView class]] ||
         [delegate isKindOfClass:[UITextField class]]) {
-        return; // 系统类/输入框本身跳过
+        return; // 输入框本身由 %hook UITextView/UITextField 处理，避免双重 hook
     }
-    BOOL defines = NO;
-    unsigned int mc = 0;
-    Method *mlist = class_copyMethodList(dcls, &mc);
-    for (unsigned int i = 0; i < mc; i++) {
-        if (method_getName(mlist[i]) == @selector(editMenuInteraction:menuForConfiguration:suggestedActions:)) { defines = YES; break; }
-    }
-    if (mlist) free(mlist);
-    if (defines) {
-        Method m = class_getInstanceMethod(dcls, @selector(editMenuInteraction:menuForConfiguration:suggestedActions:));
-        IMP newImp = (IMP)chatmenu_editMenuReplacement;
-        IMP origImp = method_setImplementation(m, newImp); // App 类，PAC 安全
-        if (origImp) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)origImp] forKey:key];
-        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked %@ orig=%d", key, origImp ? 1 : 0]);
+    SEL sel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
+    Method m = class_getInstanceMethod(dcls, sel);
+    if (!m) { chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip no-method %@", key]); return; }
+    IMP newImp = (IMP)chatmenu_editMenuReplacement;
+    if (class_containsMethod(dcls, sel)) {
+        // 类自身实现该方法 → 直接替换 IMP（仅影响该类，安全）
+        IMP orig = method_setImplementation(m, newImp);
+        if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
+        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked(self) %@ orig=%d", key, orig ? 1 : 0]);
     } else {
-        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip not-override %@", key]);
+        // 继承自父类（UIKit）→ 在子类上 addMethod 覆盖，避免污染父类全局 IMP
+        IMP orig = method_getImplementation(m); // 父类（UIKit）实现
+        if (class_addMethod(dcls, sel, newImp, method_getTypeEncoding(m))) {
+            if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
+            chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked(add) %@ orig=%d", key, orig ? 1 : 0]);
+        } else {
+            chatmenu_log([NSString stringWithFormat:@"[emiDelegate] addMethod-fail %@", key]);
+        }
     }
 }
 
@@ -509,5 +515,5 @@ static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.6 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.7 loaded %@", [NSDate date]]);
 }
