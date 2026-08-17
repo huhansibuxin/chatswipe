@@ -4,15 +4,17 @@
 // 单击/长按输入框弹出的编辑菜单 → 只保留 全选/复制/粘贴（按此顺序），其余（扫描文本 scanDocument:、
 // 剪切、选择、替换、查找、翻译、分享、以及 App 自定义项 换行/全屏输入/#话题/搜一搜 等）一律移除。
 //
-// v1.5.3 稳定版（老板拍板：放弃自绘菜单适配，只要三件套稳定 + 扫描文本必去掉 + 顺序 全选→复制→粘贴）：
-//   实测结论：QQ 在 iOS16 仍走老式 UIMenuController（canPerformAction 被查、editMenuInteraction/updateVisibleMenu 不触发）。
-//   老 UIMenuController 的系统项顺序写死、改不了 → 用「抑制系统三件套 + 注入自定义 UIMenuItem(顺序由数组定)」稳排序。
-//   同时保留现代路径(UIEditMenuInteraction)的 editMenuInteraction: 排序，覆盖微信/Telegram 等。
-//   删除全部诊断探针（[cpa]/[emi]/[ucUpdate]/[menuView] 刷屏）。
+// v1.5.4 稳定排序版（真因修复）：
+//   实测（v1.5.3 日志）QQ 走**现代 UIEditMenuInteraction**，但其 delegate 不是输入框本身（是 App 自己的类），
+//   所以 hook UITextView 的 editMenuInteraction: 永不触发、排序从未执行。
+//   修复：hook UIEditMenuInteraction 的 setDelegate:，捕获真实 delegate 类（仅 App 类→PAC 安全），
+//   用 MSHookMessageEx 替换其 editMenuInteraction:menuForConfiguration:suggestedActions: → 过滤+排序（全选→复制→粘贴）。
+//   同时保留 legacy UIMenuController 注入兜底（兼容仍走老 API 的 App），以及 canPerformAction 三件套+扫描文本必去掉。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <substrate.h>
 #import <math.h>
 
 // ==================== 配置（可选 /var/mobile/Documents/chatswipe.plist） ====================
@@ -22,16 +24,20 @@ static BOOL     gPasteEnabled= YES;   // 右滑粘贴
 static CGFloat  gThreshold   = 45.0;  // 触发所需最小水平位移(pt)
 static BOOL     gMenuFilterEnabled = YES; // 编辑菜单精简总开关（只留 全选/复制/粘贴）
 
-// ==================== 菜单状态（路径检测） ====================
+// ==================== 菜单状态 ====================
 static BOOL gInjectingCustom = NO;          // 正在构建老式 UIMenuController（legacy 路径）时置 YES
-static __weak UIResponder *gCurrentInput = nil; // 当前 first responder（仅记可编辑输入框），用于区分文本菜单 vs 其他菜单
+static __weak UIResponder *gCurrentInput = nil; // 当前 first responder（仅记可编辑输入框）
 
-// 我们注入的自定义 action（避免与系统 copy:/paste:/selectAll: 冲突，且能在 legacy 路径稳定排序）
+// 我们注入的自定义 action（legacy 路径用，避免与系统 copy:/paste:/selectAll: 冲突）
 static SEL gSelSelectAll = nil;
 static SEL gSelCopy       = nil;
 static SEL gSelPaste      = nil;
 
-// ==================== 诊断日志（写 App 沙盒 Documents，%ctor 先清空 = 清除上一版本日志） ====================
+// ==================== 现代路径 delegate hook 状态 ====================
+static NSMutableDictionary *gEditMenuOrig = nil; // 按类名存 delegate 原 editMenuInteraction IMP
+static NSMutableSet *gEditMenuHooked = nil;      // 已 hook 的 delegate 类（去重）
+
+// ==================== 诊断日志（写 App 沙盒 Documents，%ctor 先清空） ====================
 static void chatmenu_log(NSString *msg) {
     @try {
         NSString *path = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
@@ -51,7 +57,6 @@ static void chatmenu_log(NSString *msg) {
 }
 
 // ==================== 编辑菜单三件套 ====================
-// 白名单：仅允许 全选/复制/粘贴 出现在输入框菜单中（扫描文本 scanDocument: 不在白名单 → 必去掉）。
 static BOOL chatmenu_isAllowedAction(SEL action) {
     if (action == @selector(selectAll:)) return YES;
     if (action == @selector(copy:))      return YES;
@@ -60,36 +65,32 @@ static BOOL chatmenu_isAllowedAction(SEL action) {
 }
 
 // 过滤 + 排序 UIMenu：只保留白名单 UICommand（selectAll/copy/paste），丢弃 UIAction（App 自定义项）
-// 与其余非白名单项（含扫描文本 scanDocument:）；白名单项按「全选 → 复制 → 粘贴」顺序重排；其他未知元素放末尾。
+// 与其余非白名单项（含扫描文本 scanDocument:）；白名单项按「全选 → 复制 → 粘贴」顺序重排。
 static id chatmenu_filterAndOrderMenu(id menu) {
     if (!menu) return nil;
     Class menuCls   = NSClassFromString(@"UIMenu");
     Class cmdCls    = NSClassFromString(@"UICommand");
     Class actionCls = NSClassFromString(@"UIAction");
-    if (!menuCls || ![menu isKindOfClass:menuCls]) return menu; // 非 UIMenu 交给上层判断
+    if (!menuCls || ![menu isKindOfClass:menuCls]) return menu;
     NSArray *children = [menu valueForKey:@"children"];
     if (!children || children.count == 0) return menu;
 
-    NSMutableArray *whitelist = [NSMutableArray array]; // 白名单 UICommand（待排序）
-    NSMutableArray *others    = [NSMutableArray array]; // 子菜单/未知元素（放末尾）
+    NSMutableArray *whitelist = [NSMutableArray array];
+    NSMutableArray *others    = [NSMutableArray array];
     for (id el in children) {
         if (menuCls && [el isKindOfClass:menuCls]) {
-            id f = chatmenu_filterAndOrderMenu(el); // 递归子菜单
+            id f = chatmenu_filterAndOrderMenu(el);
             if (f) [others addObject:f];
         } else if (cmdCls && [el isKindOfClass:cmdCls]) {
             SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-            if (chatmenu_isAllowedAction(a)) {
-                [whitelist addObject:el];
-            }
-            // 非白名单 UICommand（含 scanDocument 扫描文本）：丢弃
+            if (chatmenu_isAllowedAction(a)) [whitelist addObject:el];
         } else if (actionCls && [el isKindOfClass:actionCls]) {
             // App 自定义 UIAction：丢弃
         } else {
-            [others addObject:el]; // 其他未知元素保留
+            [others addObject:el];
         }
     }
 
-    // 排序：全选(selectAll:) → 复制(copy:) → 粘贴(paste:)
     NSArray *order = @[NSStringFromSelector(@selector(selectAll:)),
                        NSStringFromSelector(@selector(copy:)),
                        NSStringFromSelector(@selector(paste:))];
@@ -97,18 +98,12 @@ static id chatmenu_filterAndOrderMenu(id menu) {
     for (NSString *selName in order) {
         for (id el in whitelist) {
             SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-            if ([NSStringFromSelector(a) isEqualToString:selName]) {
-                [sorted addObject:el];
-                break;
-            }
+            if ([NSStringFromSelector(a) isEqualToString:selName]) { [sorted addObject:el]; break; }
         }
     }
-    for (id el in whitelist) { // 理论不会有的多余白名单项，兜底放后面
-        if (![sorted containsObject:el]) [sorted addObject:el];
-    }
+    for (id el in whitelist) { if (![sorted containsObject:el]) [sorted addObject:el]; }
     [sorted addObjectsFromArray:others];
 
-    // 无变化时原样返回（避免无谓重建）
     BOOL changed = (sorted.count != children.count);
     if (!changed) {
         for (NSUInteger i = 0; i < children.count; i++) {
@@ -133,13 +128,53 @@ static void chatswipe_loadConfig() {
     } @catch (id e) {}
 }
 
-// ==================== 共享 pan delegate：允许与原生文本选择手势并存 ====================
+// App 类判定：有 image 且属于系统/框架 → NO；无 image（运行时动态类，如 QQ 的 _qlvr_obj_hook_）→ 按 App 类放行。
+static BOOL chatmenu_isAppClass(Class cls) {
+    if (!cls) return NO;
+    const char *img = class_getImageName(cls);
+    if (!img || !*img) return YES; // 动态类（无 image）按 App 类处理
+    NSString *s = [NSString stringWithUTF8String:img];
+    if ([s containsString:@"/System/Library/"] ||
+        [s containsString:@"/Library/"] ||
+        [s containsString:@"/usr/"] ||
+        [s containsString:@"/var/jb/Library/"] ||
+        [s containsString:@"/var/jb/usr/"] ||
+        [s containsString:@"/Applications/"]) {
+        return NO;
+    }
+    return YES;
+}
+
+// 现代路径 replacement：调用 delegate 原 editMenuInteraction: → 过滤 + 排序。
+static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested) {
+    Class cls = object_getClass(self);
+    IMP orig = NULL;
+    Class sc = cls;
+    while (sc) {
+        NSValue *v = [gEditMenuOrig objectForKey:NSStringFromClass(sc)];
+        if (v) { orig = [v pointerValue]; break; }
+        sc = class_getSuperclass(sc);
+    }
+    id origMenu = nil;
+    if (orig) {
+        id (*fn)(id, SEL, id, id, NSArray *) = (void *)orig;
+        origMenu = fn(self, _cmd, interaction, config, suggested);
+    } else {
+        struct objc_super sup = { self, class_getSuperclass(cls) };
+        id (*fn)(struct objc_super *, SEL, id, id, NSArray *) = (void *)objc_msgSendSuper;
+        origMenu = fn(&sup, _cmd, interaction, config, suggested);
+    }
+    if (!gMenuFilterEnabled) return origMenu;
+    return chatmenu_filterAndOrderMenu(origMenu);
+}
+
+// ==================== 共享 pan delegate ====================
 @interface ChatSwipePanDelegate : NSObject <UIGestureRecognizerDelegate>
 @end
 @implementation ChatSwipePanDelegate
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
 shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
-    return YES; // 不抢原生手势，只在 Ended 时按阈值决定要不要动作
+    return YES;
 }
 @end
 static ChatSwipePanDelegate *gPanDelegate = nil;
@@ -147,8 +182,6 @@ static ChatSwipePanDelegate *gPanDelegate = nil;
 // ==================== 给输入框挂 pan 手势（仅挂一次） ====================
 static void chatswipe_attachIfNeeded(UIView *view) {
     if (!gEnabled || !view) return;
-    // 只给"可编辑"输入区挂手势：跳过只读展示文本框（如消息气泡，横滑会清掉其显示文本）
-    // 与密码框（secureTextEntry），避免误清/误粘敏感内容。
     if ([view isKindOfClass:[UITextView class]]) {
         if (!((UITextView *)view).isEditable) return;
     } else if ([view isKindOfClass:[UITextField class]]) {
@@ -163,7 +196,7 @@ static void chatswipe_attachIfNeeded(UIView *view) {
 
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc] initWithTarget:view action:@selector(chatswipe_handlePan:)];
-    pan.cancelsTouchesInView = NO;   // 不取消触摸，避免破坏点选/拖选
+    pan.cancelsTouchesInView = NO;
     pan.delaysTouchesBegan  = NO;
     if (!gPanDelegate) gPanDelegate = [[ChatSwipePanDelegate alloc] init];
     pan.delegate = gPanDelegate;
@@ -173,8 +206,6 @@ static void chatswipe_attachIfNeeded(UIView *view) {
 // ==================== 动作：清空 / 粘贴 ====================
 static void chatswipe_clear(UIView *view) {
     @try {
-        // 统一走 replaceRange：UITextView 会自动触发 textViewDidChange:（勿手调，避免重复触发）；
-        // UITextField 程序化编辑不会自动发 editingChanged，故补一次（且仅一次）。
         if ([view isKindOfClass:[UITextView class]]) {
             UITextView *tv = (UITextView *)view;
             UITextRange *all = [tv textRangeFromPosition:tv.beginningOfDocument toPosition:tv.endOfDocument];
@@ -192,9 +223,6 @@ static void chatswipe_paste(UIView *view) {
     @try {
         NSString *pb = [UIPasteboard generalPasteboard].string;
         if (!pb || pb.length == 0) return;
-        // 统一走 replaceRange：有选区则替换、无选区(或 nil)则插到末尾/光标处。
-        // UITextView 靠 replaceRange 自动触发 textViewDidChange:（勿手调）；
-        // UITextField 程序化编辑不会自动发 editingChanged，故补一次（且仅一次）。
         if ([view isKindOfClass:[UITextView class]]) {
             UITextView *tv = (UITextView *)view;
             UITextRange *r = tv.selectedTextRange
@@ -210,7 +238,7 @@ static void chatswipe_paste(UIView *view) {
     } @catch (id e) {}
 }
 
-// ==================== pan 回调（挂在 UIView 上，所有输入框都能响应） ====================
+// ==================== pan 回调 ====================
 @interface UIView (ChatSwipe)
 - (void)chatswipe_handlePan:(UIPanGestureRecognizer *)pan;
 @end
@@ -219,23 +247,16 @@ static void chatswipe_paste(UIView *view) {
     if (pan.state != UIGestureRecognizerStateEnded) return;
     CGPoint t = [pan translationInView:self];
     CGFloat dx = t.x, dy = t.y;
-    if (fabs(dx) <= fabs(dy)) return;       // 不够水平
-    if (fabs(dx) < gThreshold) return;      // 位移太短
+    if (fabs(dx) <= fabs(dy)) return;
+    if (fabs(dx) < gThreshold) return;
     if (dx < 0) { if (gClearEnabled)  chatswipe_clear(self);  }
     else       { if (gPasteEnabled)  chatswipe_paste(self);  }
 }
 @end
 
 // ==================== 编辑菜单三件套 Hook ====================
-// 两条路径：
-//   PATH A 现代(UIEditMenuInteraction, iOS16 微信/TG 等)：canPerformAction 保留三件套，editMenuInteraction: 过滤+排序。
-//   PATH B 老式(UIMenuController, QQ 实测走这条)：构建时抑制系统三件套(gInjectingCustom)，
-//           由 UIMenuController setMenuVisible: 注入自定义 UIMenuItem(顺序=数组顺序)，稳排序。
-//
-// canPerformAction 分支：
-//   - 自定义 action(chatswipe_*) 始终 YES（legacy 注入项的可用性，且在菜单显示后重查时仍可用）；
-//   - gInjectingCustom=YES（legacy 构建中）：系统 copy/paste/selectAll 抑制(NO)，只留自定义 3 项；
-//   - 否则（modern 路径）：白名单三件套 YES，其余(NO，扫描文本 scanDocument 必去掉)。
+// canPerformAction：保留三件套（modern 路径），抑制其余（含 scanDocument 扫描文本必去掉）。
+// legacy 路径由 gInjectingCustom 分支抑制系统三件套、仅留注入的自定义项。
 %hook UITextView
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
@@ -247,7 +268,6 @@ static void chatswipe_paste(UIView *view) {
     if (gCurrentInput == self) gCurrentInput = nil;
     return r;
 }
-// 兜底：输入框显示到窗口即挂手势，不依赖它先成为 first responder。
 - (void)didMoveToWindow {
     %orig;
     if (self.window) { chatswipe_attachIfNeeded(self); if (self.isFirstResponder) gCurrentInput = self; }
@@ -255,15 +275,16 @@ static void chatswipe_paste(UIView *view) {
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
-    if (action == gSelSelectAll || action == gSelCopy || action == gSelPaste) return YES; // 我们注入的自定义项，始终可用
-    if (gInjectingCustom) return NO;                       // legacy 构建中：抑制系统三件套，只留自定义 3 项
-    if (chatmenu_isAllowedAction(action)) return YES;      // modern 路径：三件套显示
-    return NO;                                             // 其余（含 scanDocument 扫描文本）一律不显示
+    if (action == gSelSelectAll || action == gSelCopy || action == gSelPaste) return YES;
+    if (gInjectingCustom) return NO;
+    if (chatmenu_isAllowedAction(action)) return YES;
+    return NO;
 }
 
-// iOS 16 现代路径：对最终 UIMenu 过滤 + 排序（全选→复制→粘贴）。
+// 兜底：若 delegate 恰为输入框自身（部分 App），此 hook 直接排序。
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
+    chatmenu_log([NSString stringWithFormat:@"[emi] self=%@", NSStringFromClass([self class])]);
     id origMenu = %orig;
     return chatmenu_filterAndOrderMenu(origMenu);
 }
@@ -287,7 +308,6 @@ static void chatswipe_paste(UIView *view) {
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
-    // 密码框不强制 复制/全选（防泄密），但 粘贴 仍允许
     if ((action == @selector(copy:) || action == @selector(selectAll:)) && self.secureTextEntry) return %orig;
     if (action == gSelSelectAll || action == gSelCopy || action == gSelPaste) return YES;
     if (gInjectingCustom) return NO;
@@ -297,18 +317,41 @@ static void chatswipe_paste(UIView *view) {
 
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
+    chatmenu_log([NSString stringWithFormat:@"[emi] self=%@", NSStringFromClass([self class])]);
     id origMenu = %orig;
     return chatmenu_filterAndOrderMenu(origMenu);
 }
 %end
 
-// ==================== PATH B：老式 UIMenuController（QQ 实测路径） ====================
-// 显示菜单前，若当前 first responder 是可编辑输入框，则注入自定义 UIMenuItem（顺序由数组定），
-// 并在构建期(gInjectingCustom)抑制系统三件套，最终只显示：全选 → 复制 → 粘贴。
+// ==================== 现代路径：捕获 UIEditMenuInteraction 真实 delegate 并 hook（QQ 实测走这条） ====================
+%hook UIEditMenuInteraction
+- (void)setDelegate:(id)delegate {
+    if (gMenuFilterEnabled && delegate &&
+        chatmenu_isAppClass([delegate class]) &&
+        ![delegate isKindOfClass:[UITextView class]] &&
+        ![delegate isKindOfClass:[UITextField class]]) {
+        Class dcls = [delegate class];
+        NSString *key = NSStringFromClass(dcls);
+        if (![gEditMenuHooked containsObject:key]) {
+            [gEditMenuHooked addObject:key];
+            IMP origImp = NULL;
+            MSHookMessageEx(dcls, @selector(editMenuInteraction:menuForConfiguration:suggestedActions:),
+                            (IMP)chatmenu_editMenuReplacement, &origImp);
+            if (origImp) [gEditMenuOrig setObject:[NSValue valueWithPointer:origImp] forKey:key];
+            chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked %@ orig=%d", key, origImp ? 1 : 0]);
+        }
+    }
+    %orig;
+}
+%end
+
+// ==================== PATH B：老式 UIMenuController（兼容仍走老 API 的 App） ====================
 %hook UIMenuController
 - (void)setMenuVisible:(BOOL)visible animated:(BOOL)animated {
     if (visible && gMenuFilterEnabled) {
         UIResponder *fr = gCurrentInput;
+        chatmenu_log([NSString stringWithFormat:@"[ucVis] visible=1 fr=%@",
+                      fr ? NSStringFromClass([fr class]) : @"NIL"]);
         if (([fr isKindOfClass:[UITextView class]] || [fr isKindOfClass:[UITextField class]]) &&
             !([fr isKindOfClass:[UITextField class]] && ((UITextField *)fr).secureTextEntry)) {
             gInjectingCustom = YES;
@@ -317,16 +360,15 @@ static void chatswipe_paste(UIView *view) {
             [items addObject:[[UIMenuItem alloc] initWithTitle:@"复制" action:gSelCopy]];
             [items addObject:[[UIMenuItem alloc] initWithTitle:@"粘贴" action:gSelPaste]];
             [self setMenuItems:items];
-            chatmenu_log([NSString stringWithFormat:@"[legacyMenu] injected 全选/复制/粘贴 (fr=%@)",
-                          NSStringFromClass([fr class])]);
+            chatmenu_log(@"[legacyMenu] injected 全选/复制/粘贴");
         }
     }
     %orig;
-    gInjectingCustom = NO; // 构建结束，复位（自定义项后续重查仍靠 gSel* 恒 YES 保持可用）
+    gInjectingCustom = NO;
 }
 %end
 
-// ==================== 自定义 action 转发（被 UIMenuItem 点击时调用，转发到系统原方法） ====================
+// ==================== 自定义 action 转发（legacy 路径 UIMenuItem 点击时调用） ====================
 %hook UITextView
 - (void)chatswipe_selectAll:(id)sender { [self selectAll:sender]; }
 - (void)chatswipe_copy:(id)sender      { [self copy:sender]; }
@@ -339,19 +381,17 @@ static void chatswipe_paste(UIView *view) {
 %end
 
 %ctor {
-    // 自定义 action 选择器（在 %ctor 早期确定，避免每次比较字符串）
     gSelSelectAll = NSSelectorFromString(@"chatswipe_selectAll:");
     gSelCopy       = NSSelectorFromString(@"chatswipe_copy:");
     gSelPaste      = NSSelectorFromString(@"chatswipe_paste:");
+    gEditMenuOrig  = [NSMutableDictionary dictionary];
+    gEditMenuHooked = [NSMutableSet set];
 
     chatswipe_loadConfig();
-    // 清除上一版本日志 + 写加载标记（写 App 沙盒 Documents，SSH 可 cat：
-    //   /var/mobile/Containers/Data/Application/<App-UUID>/Documents/chatswipe.log）
     @try {
         NSString *path = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.3 loaded %@", [NSDate date]]);
-    // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.4 loaded %@", [NSDate date]]);
 }
