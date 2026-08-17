@@ -4,16 +4,11 @@
 // 单击/长按输入框弹出的编辑菜单 → 只保留 全选/复制/粘贴（按此顺序），其余（扫描文本 scanDocument:、
 // 剪切、选择、替换、查找、翻译、分享、以及 App 自定义项 换行/全屏输入/#话题/搜一搜 等）一律移除。
 //
-// v1.5.0 精简版（老板拍板：放弃自绘菜单适配，只要三件套稳定 + 扫描文本必去掉）：
-//   - 删掉全部探针（UIButton/UIMenuItem/didMoveToWindow/presentViewController）
-//   - 删掉全部动态 hook（UIMenuController 全家 / 懒加载子类 / delegate hook / 交互期枚举 /
-//     NSObject 全局 editMenuInteraction / textView:editMenuForTextRange / inputAssistantItem）
-//   - 只保留编译期 %hook（与滑动功能同机制，ARM64e PAC 安全）：
-//       1) canPerformAction:withSender: —— 三件套强制显示，其余 NO（含 scanDocument 扫描文本，必去掉）
-//       2) editMenuInteraction:menuForConfiguration:suggestedActions: —— 对最终 UIMenu 过滤 + 排序
-//       3) UIEditMenuInteraction updateVisibleMenu —— iOS16 系统菜单显示/更新时，KVC 过滤排序 _menu
-//       4) buildMenuWithBuilder: —— iOS 13–15 旧路径兜底过滤
-//   - 排序：全选(selectAll:) → 复制(copy:) → 粘贴(paste:)
+// v1.5.3 稳定版（老板拍板：放弃自绘菜单适配，只要三件套稳定 + 扫描文本必去掉 + 顺序 全选→复制→粘贴）：
+//   实测结论：QQ 在 iOS16 仍走老式 UIMenuController（canPerformAction 被查、editMenuInteraction/updateVisibleMenu 不触发）。
+//   老 UIMenuController 的系统项顺序写死、改不了 → 用「抑制系统三件套 + 注入自定义 UIMenuItem(顺序由数组定)」稳排序。
+//   同时保留现代路径(UIEditMenuInteraction)的 editMenuInteraction: 排序，覆盖微信/Telegram 等。
+//   删除全部诊断探针（[cpa]/[emi]/[ucUpdate]/[menuView] 刷屏）。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -26,6 +21,15 @@ static BOOL     gClearEnabled= YES;   // 左滑清空
 static BOOL     gPasteEnabled= YES;   // 右滑粘贴
 static CGFloat  gThreshold   = 45.0;  // 触发所需最小水平位移(pt)
 static BOOL     gMenuFilterEnabled = YES; // 编辑菜单精简总开关（只留 全选/复制/粘贴）
+
+// ==================== 菜单状态（路径检测） ====================
+static BOOL gInjectingCustom = NO;          // 正在构建老式 UIMenuController（legacy 路径）时置 YES
+static __weak UIResponder *gCurrentInput = nil; // 当前 first responder（仅记可编辑输入框），用于区分文本菜单 vs 其他菜单
+
+// 我们注入的自定义 action（避免与系统 copy:/paste:/selectAll: 冲突，且能在 legacy 路径稳定排序）
+static SEL gSelSelectAll = nil;
+static SEL gSelCopy       = nil;
+static SEL gSelPaste      = nil;
 
 // ==================== 诊断日志（写 App 沙盒 Documents，%ctor 先清空 = 清除上一版本日志） ====================
 static void chatmenu_log(NSString *msg) {
@@ -222,204 +226,124 @@ static void chatswipe_paste(UIView *view) {
 }
 @end
 
-// ==================== 编辑菜单三件套 Hook（编译期 %hook，PAC 安全） ====================
-// 1) canPerformAction: —— 三件套强制 YES，其余 NO（含 scanDocument 扫描文本/剪切/选择/替换/查找/翻译）
-// 2) editMenuInteraction: —— iOS16 对最终 UIMenu 过滤 + 排序（全选→复制→粘贴）
-// 3) UIEditMenuInteraction updateVisibleMenu —— iOS16 系统菜单显示/更新时 KVC 过滤排序（兜底系统路径）
-// 4) buildMenuWithBuilder: —— iOS 13–15 旧路径兜底
+// ==================== 编辑菜单三件套 Hook ====================
+// 两条路径：
+//   PATH A 现代(UIEditMenuInteraction, iOS16 微信/TG 等)：canPerformAction 保留三件套，editMenuInteraction: 过滤+排序。
+//   PATH B 老式(UIMenuController, QQ 实测走这条)：构建时抑制系统三件套(gInjectingCustom)，
+//           由 UIMenuController setMenuVisible: 注入自定义 UIMenuItem(顺序=数组顺序)，稳排序。
+//
+// canPerformAction 分支：
+//   - 自定义 action(chatswipe_*) 始终 YES（legacy 注入项的可用性，且在菜单显示后重查时仍可用）；
+//   - gInjectingCustom=YES（legacy 构建中）：系统 copy/paste/selectAll 抑制(NO)，只留自定义 3 项；
+//   - 否则（modern 路径）：白名单三件套 YES，其余(NO，扫描文本 scanDocument 必去掉)。
 %hook UITextView
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
-    if (r) chatswipe_attachIfNeeded(self);
+    if (r) { chatswipe_attachIfNeeded(self); gCurrentInput = self; }
+    return r;
+}
+- (BOOL)resignFirstResponder {
+    BOOL r = %orig;
+    if (gCurrentInput == self) gCurrentInput = nil;
     return r;
 }
 // 兜底：输入框显示到窗口即挂手势，不依赖它先成为 first responder。
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) chatswipe_attachIfNeeded(self);
+    if (self.window) { chatswipe_attachIfNeeded(self); if (self.isFirstResponder) gCurrentInput = self; }
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
-    @try { chatmenu_log([NSString stringWithFormat:@"[cpa] %@", NSStringFromSelector(action)]); } @catch (id e) {}
-    if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
-    return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
+    if (action == gSelSelectAll || action == gSelCopy || action == gSelPaste) return YES; // 我们注入的自定义项，始终可用
+    if (gInjectingCustom) return NO;                       // legacy 构建中：抑制系统三件套，只留自定义 3 项
+    if (chatmenu_isAllowedAction(action)) return YES;      // modern 路径：三件套显示
+    return NO;                                             // 其余（含 scanDocument 扫描文本）一律不显示
 }
 
-// iOS 16 主拦截点（基类实例 + 子类未 override 的情形）：过滤 + 排序。
+// iOS 16 现代路径：对最终 UIMenu 过滤 + 排序（全选→复制→粘贴）。
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
-    @try { chatmenu_log([NSString stringWithFormat:@"[emi] self=%@", NSStringFromClass([self class])]); } @catch (id e) {}
     id origMenu = %orig;
     return chatmenu_filterAndOrderMenu(origMenu);
-}
-
-// 兜底：iOS 13–15 旧路径（UIMenuController + UIMenuBuilder）。
-- (void)buildMenuWithBuilder:(id)builder {
-    %orig;
-    if (!gMenuFilterEnabled) return;
-    if (@available(iOS 13.0, *)) {
-        if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
-            @try {
-                NSString *editId = @"com.apple.menu.identifier.edit";
-                Class cmdCls = NSClassFromString(@"UICommand");
-                Class menuCls = NSClassFromString(@"UIMenu");
-                id block = ^NSArray *(NSArray *children) {
-                    NSMutableArray *keep = [NSMutableArray array];
-                    for (id el in children) {
-                        if (menuCls && [el isKindOfClass:menuCls]) continue;
-                        if (cmdCls && [el isKindOfClass:cmdCls]) {
-                            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
-                        }
-                    }
-                    return keep;
-                };
-                ((void (*)(id, SEL, id, id))objc_msgSend)(builder,
-                    @selector(replaceChildrenOfMenuForIdentifier:withChildren:), editId, block);
-            } @catch (id e) {}
-        }
-    }
 }
 %end
 
 %hook UITextField
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
-    if (r) chatswipe_attachIfNeeded(self);
+    if (r) { chatswipe_attachIfNeeded(self); gCurrentInput = self; }
+    return r;
+}
+- (BOOL)resignFirstResponder {
+    BOOL r = %orig;
+    if (gCurrentInput == self) gCurrentInput = nil;
     return r;
 }
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) chatswipe_attachIfNeeded(self);
+    if (self.window) { chatswipe_attachIfNeeded(self); if (self.isFirstResponder) gCurrentInput = self; }
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
     // 密码框不强制 复制/全选（防泄密），但 粘贴 仍允许
     if ((action == @selector(copy:) || action == @selector(selectAll:)) && self.secureTextEntry) return %orig;
-    if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
-    return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
+    if (action == gSelSelectAll || action == gSelCopy || action == gSelPaste) return YES;
+    if (gInjectingCustom) return NO;
+    if (chatmenu_isAllowedAction(action)) return YES;
+    return NO;
 }
 
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
-    @try { chatmenu_log([NSString stringWithFormat:@"[emi] self=%@", NSStringFromClass([self class])]); } @catch (id e) {}
     id origMenu = %orig;
     return chatmenu_filterAndOrderMenu(origMenu);
 }
-
-- (void)buildMenuWithBuilder:(id)builder {
-    %orig;
-    if (!gMenuFilterEnabled) return;
-    if (@available(iOS 13.0, *)) {
-        if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
-            @try {
-                NSString *editId = @"com.apple.menu.identifier.edit";
-                Class cmdCls = NSClassFromString(@"UICommand");
-                Class menuCls = NSClassFromString(@"UIMenu");
-                id block = ^NSArray *(NSArray *children) {
-                    NSMutableArray *keep = [NSMutableArray array];
-                    for (id el in children) {
-                        if (menuCls && [el isKindOfClass:menuCls]) continue;
-                        if (cmdCls && [el isKindOfClass:cmdCls]) {
-                            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
-                        }
-                    }
-                    return keep;
-                };
-                ((void (*)(id, SEL, id, id))objc_msgSend)(builder,
-                    @selector(replaceChildrenOfMenuForIdentifier:withChildren:), editId, block);
-            } @catch (id e) {}
-        }
-    }
-}
 %end
 
-// v1.5.1：进入就打标 + 多 key 找 menu + dump children，定位 QQ 菜单是否走系统 UIEditMenuInteraction。
-%hook UIEditMenuInteraction
-- (void)updateVisibleMenu {
-    %orig;
-    if (!gMenuFilterEnabled) return;
-    @try {
-        chatmenu_log(@"[ucUpdate] called");
-        id menu = nil;
-        NSArray *keys = @[@"_menu", @"menu", @"_menuItems", @"menuItems"];
-        for (NSString *k in keys) {
-            @try {
-                id v = [self valueForKey:k];
-                if (v && [v isKindOfClass:NSClassFromString(@"UIMenu")]) {
-                    menu = v;
-                    chatmenu_log([NSString stringWithFormat:@"[ucUpdate] menu via %@", k]);
-                    break;
-                }
-            } @catch (id e) {}
-        }
-        if (!menu) { chatmenu_log(@"[ucUpdate] no menu via KVC"); return; }
-        BOOL hasWhitelist = NO;
-        Class cmdCls = NSClassFromString(@"UICommand");
-        NSArray *ch = [menu valueForKey:@"children"];
-        chatmenu_log([NSString stringWithFormat:@"[ucUpdate] children=%lu", (unsigned long)ch.count]);
-        for (id el in ch) {
-            NSString *extra = @"";
-            if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
-            if (cmdCls && [el isKindOfClass:cmdCls]) {
-                SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
-                extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
-                if (chatmenu_isAllowedAction(a)) hasWhitelist = YES;
-            }
-            chatmenu_log([NSString stringWithFormat:@"[ucUpdate]  - %@ %@", [el class], extra]);
-        }
-        if (!hasWhitelist) return;
-        id filtered = chatmenu_filterAndOrderMenu(menu);
-        if (filtered != menu) {
-            for (NSString *k in keys) {
-                @try {
-                    [self setValue:filtered forKey:k];
-                    chatmenu_log([NSString stringWithFormat:@"[ucUpdate] set %@ OK", k]);
-                    break;
-                } @catch (id e) {}
-            }
-        }
-    } @catch (id e) {}
-}
-%end
-
-// v1.5.2：恢复 UIMenuController 打标——确认 QQ 是否走老 API UIMenuController 显示菜单。
+// ==================== PATH B：老式 UIMenuController（QQ 实测路径） ====================
+// 显示菜单前，若当前 first responder 是可编辑输入框，则注入自定义 UIMenuItem（顺序由数组定），
+// 并在构建期(gInjectingCustom)抑制系统三件套，最终只显示：全选 → 复制 → 粘贴。
 %hook UIMenuController
 - (void)setMenuVisible:(BOOL)visible animated:(BOOL)animated {
-    chatmenu_log([NSString stringWithFormat:@"[ucVisible] visible=%d", visible]);
+    if (visible && gMenuFilterEnabled) {
+        UIResponder *fr = gCurrentInput;
+        if (([fr isKindOfClass:[UITextView class]] || [fr isKindOfClass:[UITextField class]]) &&
+            !([fr isKindOfClass:[UITextField class]] && ((UITextField *)fr).secureTextEntry)) {
+            gInjectingCustom = YES;
+            NSMutableArray *items = [NSMutableArray array];
+            [items addObject:[[UIMenuItem alloc] initWithTitle:@"全选" action:gSelSelectAll]];
+            [items addObject:[[UIMenuItem alloc] initWithTitle:@"复制" action:gSelCopy]];
+            [items addObject:[[UIMenuItem alloc] initWithTitle:@"粘贴" action:gSelPaste]];
+            [self setMenuItems:items];
+            chatmenu_log([NSString stringWithFormat:@"[legacyMenu] injected 全选/复制/粘贴 (fr=%@)",
+                          NSStringFromClass([fr class])]);
+        }
+    }
     %orig;
-}
-- (void)update {
-    chatmenu_log(@"[ucUpdate2] called");
-    %orig;
+    gInjectingCustom = NO; // 构建结束，复位（自定义项后续重查仍靠 gSel* 恒 YES 保持可用）
 }
 %end
 
-// v1.5.2：菜单 view 探测——打印类名含 Menu/EditMenu/ContextMenu/Popup/Sheet/Assistant/EditingOverlay 的新 view，
-// 判断菜单是系统 view（_UI...Menu...）还是 QQ 自绘 view（NTAIO.../QQ...）。
-%hook UIView
-- (void)didMoveToWindow {
-    %orig;
-    if (self.window) {
-        static int sCnt = 0;
-        if (sCnt < 500) {
-            NSString *cn = NSStringFromClass([self class]);
-            NSRange r = [cn rangeOfString:@"Menu|EditMenu|ContextMenu|Popup|Sheet|Assistant|EditingOverlay|Editing"
-                                  options:NSRegularExpressionSearch];
-            if (r.location != NSNotFound) {
-                sCnt++;
-                chatmenu_log([NSString stringWithFormat:@"[menuView] %@ (super=%@)",
-                              cn, NSStringFromClass([[self superview] class])]);
-            }
-        }
-    }
-}
+// ==================== 自定义 action 转发（被 UIMenuItem 点击时调用，转发到系统原方法） ====================
+%hook UITextView
+- (void)chatswipe_selectAll:(id)sender { [self selectAll:sender]; }
+- (void)chatswipe_copy:(id)sender      { [self copy:sender]; }
+- (void)chatswipe_paste:(id)sender     { [self paste:sender]; }
+%end
+%hook UITextField
+- (void)chatswipe_selectAll:(id)sender { [self selectAll:sender]; }
+- (void)chatswipe_copy:(id)sender      { [self copy:sender]; }
+- (void)chatswipe_paste:(id)sender     { [self paste:sender]; }
 %end
 
 %ctor {
+    // 自定义 action 选择器（在 %ctor 早期确定，避免每次比较字符串）
+    gSelSelectAll = NSSelectorFromString(@"chatswipe_selectAll:");
+    gSelCopy       = NSSelectorFromString(@"chatswipe_copy:");
+    gSelPaste      = NSSelectorFromString(@"chatswipe_paste:");
+
     chatswipe_loadConfig();
     // 清除上一版本日志 + 写加载标记（写 App 沙盒 Documents，SSH 可 cat：
     //   /var/mobile/Containers/Data/Application/<App-UUID>/Documents/chatswipe.log）
@@ -428,6 +352,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.2 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.3 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
