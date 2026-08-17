@@ -76,6 +76,36 @@ static BOOL chatmenu_classOverridesSelector(Class cls, SEL sel) {
     return found;
 }
 
+// 存 canPerformAction: 原始 IMP（按类名），KVO 子类继承后可用 superclass 链回查
+static NSMutableDictionary *gCanPerformOrig = nil;
+
+static IMP chatmenu_lookupCanOrig(Class cls) {
+    Class c = cls;
+    while (c) {
+        NSValue *v = [gCanPerformOrig objectForKey:NSStringFromClass(c)];
+        if (v) return (IMP)[v pointerValue];
+        c = class_getSuperclass(c);
+    }
+    return NULL;
+}
+
+// canPerformAction: 的 replacement（C 函数，MSHookMessageEx 使用；PAC 安全）
+static BOOL chatmenu_canPerformReplacement(id self, SEL _cmd, SEL action, id sender) {
+    IMP orig = chatmenu_lookupCanOrig(object_getClass(self));
+    if (!orig) return NO;
+    if (!gMenuFilterEnabled) {
+        return ((BOOL (*)(id, SEL, SEL, id))orig)(self, _cmd, action, sender);
+    }
+    // 密码框放行 复制/全选（防泄密）；其余三件套强制显示，不在白名单一律 NO
+    if ([self isKindOfClass:[UITextField class]] &&
+        (action == @selector(copy:) || action == @selector(selectAll:)) &&
+        ((UITextField *)self).secureTextEntry) {
+        return ((BOOL (*)(id, SEL, SEL, id))orig)(self, _cmd, action, sender);
+    }
+    if (chatmenu_isAllowedAction(action)) return YES;
+    return NO;
+}
+
 static void chatmenu_hookTextViewSubclasses() {
     static SEL editSel = NULL, canSel = NULL;
     static Class tvCls = Nil, tfCls = Nil;
@@ -86,6 +116,8 @@ static void chatmenu_hookTextViewSubclasses() {
         tvCls = [UITextView class];
         tfCls = [UITextField class];
         gHookedClasses = [NSMutableSet set];
+        gEditMenuOrig = [NSMutableDictionary dictionary];
+        gCanPerformOrig = [NSMutableDictionary dictionary];
     });
     if (!tvCls || !tfCls) return;
 
@@ -108,37 +140,16 @@ static void chatmenu_hookTextViewSubclasses() {
 
         // 1) editMenuInteraction:（iOS 16 主拦截点，App 自定义项在此以 UIAction 追加）
         if (chatmenu_classOverridesSelector(cls, editSel)) {
-            Method m = class_getInstanceMethod(cls, editSel);
-            IMP orig = method_getImplementation(m);
-            IMP repl = imp_implementationWithBlock(^id(id self, id interaction, id config, NSArray *suggested) {
-                if (!gMenuFilterEnabled) {
-                    return ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
-                }
-                id menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
-                return chatmenu_filterMenu(menu);
-            });
-            method_setImplementation(m, repl);
-            [gHookedClasses addObject:key];
+            IMP orig = NULL;
+            MSHookMessageEx(cls, editSel, (IMP)chatmenu_editMenuReplacement, &orig);  // PAC 安全
+            if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(cls)];
         }
 
         // 2) canPerformAction:（控制标准动作 粘贴/复制/全选 是否进入 suggestedActions）
         if (chatmenu_classOverridesSelector(cls, canSel)) {
-            Method m = class_getInstanceMethod(cls, canSel);
-            IMP orig = method_getImplementation(m);
-            IMP repl = imp_implementationWithBlock(^BOOL(id self, SEL action, id sender) {
-                if (!gMenuFilterEnabled) {
-                    return ((BOOL (*)(id, SEL, SEL, id))orig)(self, canSel, action, sender);
-                }
-                // 密码框放行 复制/全选（防泄密）；其余三件套强制显示，不在白名单一律 NO
-                if (isTF && (action == @selector(copy:) || action == @selector(selectAll:)) &&
-                    ((UITextField *)self).secureTextEntry) {
-                    return ((BOOL (*)(id, SEL, SEL, id))orig)(self, canSel, action, sender);
-                }
-                if (chatmenu_isAllowedAction(action)) return YES;
-                return NO;
-            });
-            method_setImplementation(m, repl);
-            [gHookedClasses addObject:key];
+            IMP orig = NULL;
+            MSHookMessageEx(cls, canSel, (IMP)chatmenu_canPerformReplacement, &orig);  // PAC 安全
+            if (orig) [gCanPerformOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(cls)];
         }
     }
     free(classes);
@@ -493,7 +504,7 @@ static void chatswipe_paste(UIView *view) {
     // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
     @try {
         NSString *path = @"/var/jb/tmp/chatswipe_loaded.log";
-        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.6 loaded %@\n", [NSDate date]];
+        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.7 loaded %@\n", [NSDate date]];
         [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
