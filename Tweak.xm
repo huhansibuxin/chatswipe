@@ -5,6 +5,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <math.h>
 
 // ==================== 配置（可选 /var/mobile/Documents/chatswipe.plist） ====================
@@ -148,7 +149,7 @@ static void chatswipe_paste(UIView *view) {
     return %orig;
 }
 
-- (void)buildMenuWithBuilder:(id)builder {
+- (void)buildMenuWithBuilder:(UIMenuBuilder *)builder {
     %orig;
     if (!gMenuFilterEnabled) return;
     if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
@@ -160,7 +161,7 @@ static void chatswipe_paste(UIView *view) {
                 for (id el in children) {
                     if ([el isKindOfClass:[UIMenu class]]) continue; // 丢弃所有子菜单（替换/分享/查找 等下拉）
                     if (cmdCls && [el isKindOfClass:cmdCls]) {
-                        SEL a = (SEL)[el performSelector:@selector(action)];
+                        SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
                         if (chatmenu_isAllowedAction(a)) [keep addObject:el];
                     }
                 }
@@ -178,7 +179,7 @@ static void chatswipe_paste(UIView *view) {
     return %orig;
 }
 
-- (void)buildMenuWithBuilder:(id)builder {
+- (void)buildMenuWithBuilder:(UIMenuBuilder *)builder {
     %orig;
     if (!gMenuFilterEnabled) return;
     if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
@@ -190,7 +191,7 @@ static void chatswipe_paste(UIView *view) {
                 for (id el in children) {
                     if ([el isKindOfClass:[UIMenu class]]) continue;
                     if (cmdCls && [el isKindOfClass:cmdCls]) {
-                        SEL a = (SEL)[el performSelector:@selector(action)];
+                        SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
                         if (chatmenu_isAllowedAction(a)) [keep addObject:el];
                     }
                 }
