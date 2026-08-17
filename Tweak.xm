@@ -502,16 +502,16 @@ static void chatswipe_paste(UIView *view) {
 // 过滤 setMenuItems: 传入的自定义项（换行/全屏输入等），粘贴/复制/全选由系统按 canPerformAction 显示（已 hook）。
 %hook UIMenuController
 - (void)setMenuItems:(NSArray *)items {
-    if (!gMenuFilterEnabled) { %orig; return; }
-    @try {
-        NSArray *filtered = chatmenu_filterMenuItems(items);
-        if (filtered.count != items.count) {
-            chatmenu_log([NSString stringWithFormat:@"[ucMenu] setMenuItems %lu -> %lu",
-                          (unsigned long)items.count, (unsigned long)filtered.count]);
-            %orig(filtered);
-            return;
-        }
-    } @catch (id e) {}
+    if (gMenuFilterEnabled) {
+        @try {
+            NSArray *filtered = chatmenu_filterMenuItems(items);
+            if (filtered && filtered.count != items.count) {
+                chatmenu_log([NSString stringWithFormat:@"[ucMenu] setMenuItems %lu -> %lu",
+                              (unsigned long)items.count, (unsigned long)filtered.count]);
+                items = filtered; // 改局部变量，%orig 会用过滤后的数组（避免 %orig(带参) 的 Logos 展开坑）
+            }
+        } @catch (id e) {}
+    }
     %orig;
 }
 %end
