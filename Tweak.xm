@@ -14,7 +14,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <substrate.h>
 #import <math.h>
 
 // ==================== 配置（可选 /var/mobile/Documents/chatswipe.plist） ====================
@@ -157,11 +156,12 @@ static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id con
     }
     id origMenu = nil;
     if (orig) {
-        id (*fn)(id, SEL, id, id, NSArray *) = (void *)orig;
+        id (*fn)(id, SEL, id, id, NSArray *) = (id (*)(id, SEL, id, id, NSArray *))orig;
         origMenu = fn(self, _cmd, interaction, config, suggested);
     } else {
         struct objc_super sup = { self, class_getSuperclass(cls) };
-        id (*fn)(struct objc_super *, SEL, id, id, NSArray *) = (void *)objc_msgSendSuper;
+        id (*fn)(struct objc_super *, SEL, id, id, NSArray *) =
+            (id (*)(struct objc_super *, SEL, id, id, NSArray *))objc_msgSendSuper;
         origMenu = fn(&sup, _cmd, interaction, config, suggested);
     }
     if (!gMenuFilterEnabled) return origMenu;
@@ -334,11 +334,25 @@ static void chatswipe_paste(UIView *view) {
         NSString *key = NSStringFromClass(dcls);
         if (![gEditMenuHooked containsObject:key]) {
             [gEditMenuHooked addObject:key];
-            IMP origImp = NULL;
-            MSHookMessageEx(dcls, @selector(editMenuInteraction:menuForConfiguration:suggestedActions:),
-                            (IMP)chatmenu_editMenuReplacement, &origImp);
-            if (origImp) [gEditMenuOrig setObject:[NSValue valueWithPointer:origImp] forKey:key];
-            chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked %@ orig=%d", key, origImp ? 1 : 0]);
+            // 仅当该类【自身】定义 editMenuInteraction: 才替换（避免改到父类影响全局）。
+            BOOL defines = NO;
+            unsigned int mc = 0;
+            Method *mlist = class_copyMethodList(dcls, &mc);
+            for (unsigned int i = 0; i < mc; i++) {
+                if (method_getName(mlist[i]) == @selector(editMenuInteraction:menuForConfiguration:suggestedActions:)) {
+                    defines = YES; break;
+                }
+            }
+            if (mlist) free(mlist);
+            if (defines) {
+                Method m = class_getInstanceMethod(dcls, @selector(editMenuInteraction:menuForConfiguration:suggestedActions:));
+                IMP newImp = (IMP)chatmenu_editMenuReplacement;
+                IMP origImp = method_setImplementation(m, newImp); // App 类，PAC 安全
+                if (origImp) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)origImp] forKey:key];
+                chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked %@ orig=%d", key, origImp ? 1 : 0]);
+            } else {
+                chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip not-override %@", key]);
+            }
         }
     }
     %orig;
