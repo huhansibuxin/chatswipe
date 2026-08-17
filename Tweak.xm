@@ -288,21 +288,23 @@ static void chatmenu_hookTextMenuDelegateIfNeeded(id input) {
         chatmenu_log([NSString stringWithFormat:@"[textMenu] skip system delegate=%@", NSStringFromClass(dcls)]);
         return;
     }
+    // 1) 若 delegate 类 override 了 textView:editMenuForTextRange:suggestedActions: → hook 过滤；
+    //    未 override → 跳过（不 return，继续下面 editMenuInteraction: 检查 —— v1.3.6 return bug 修复）。
     SEL sel = @selector(textView:editMenuForTextRange:suggestedActions:);
-    if (!chatmenu_classOverridesSelector(dcls, sel)) {
+    if (chatmenu_classOverridesSelector(dcls, sel)) {
+        IMP orig = NULL;
+        MSHookMessageEx(dcls, sel, (IMP)chatmenu_textMenuReplacement, &orig);  // PAC 安全
+        if (orig) {
+            [gTextMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(dcls)];
+        }
+        chatmenu_log([NSString stringWithFormat:@"[textMenu] hooked delegate=%@ orig=%@",
+                      NSStringFromClass(dcls), orig ? @"YES" : @"NO"]);
+    } else {
         chatmenu_log([NSString stringWithFormat:@"[textMenu] skip not-override delegate=%@", NSStringFromClass(dcls)]);
-        return; // 未 override → NSObject 基类 hook（上方 %hook NSObject）已处理
     }
-    IMP orig = NULL;
-    MSHookMessageEx(dcls, sel, (IMP)chatmenu_textMenuReplacement, &orig);  // PAC 安全
-    if (orig) {
-        [gTextMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(dcls)];
-    }
-    chatmenu_log([NSString stringWithFormat:@"[textMenu] hooked delegate=%@ orig=%@",
-                  NSStringFromClass(dcls), orig ? @"YES" : @"NO"]);
 
-    // v1.3.5：delegate 类若 override 了 editMenuInteraction:（QQ 菜单 delegate 走这一层而非
-    // textView:editMenuForTextRange:，v1.3.4 实测 not-override 已证明），一并懒加载 hook 过滤。
+    // 2) delegate 类若 override 了 editMenuInteraction:（QQ 菜单 delegate 走这一层而非
+    //    textView:editMenuForTextRange:，v1.3.4 实测 not-override 已证明）→ hook 过滤。
     SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
     if (chatmenu_classOverridesSelector(dcls, editSel)) {
         NSString *k2 = [NSString stringWithFormat:@"editdelegate_%@", NSStringFromClass(dcls)];
@@ -317,6 +319,46 @@ static void chatmenu_hookTextMenuDelegateIfNeeded(id input) {
     } else {
         chatmenu_log([NSString stringWithFormat:@"[delegateMenu] skip not-override delegate=%@", NSStringFromClass(dcls)]);
     }
+}
+
+// v1.3.7：交互期"按需枚举"兜底——canPerformAction 首次触发时扫描所有已注册类，对
+// "App 类（含动态类）+ 自身实现了 editMenuInteraction:" 的类 MSHookMessageEx hook。
+// 覆盖菜单 delegate 是任意 App 类（含 QQ 运行时动态包装类 *_qlvr_obj_hook_*）的场景；
+// 交互期执行 + isAppClass 限定 + 只 hook 低频的 editMenuInteraction:，
+// 远优于 v1.2.8 的 %ctor 同步枚举（闪退根源：扫系统类 + 启动敏感期 + hook canPerformAction 高频方法）。
+static void chatmenu_hookAllEditMenuClassesIfNeeded() {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gEditMenuHookedClasses = [NSMutableSet set];
+        gEditMenuOrig = [NSMutableDictionary dictionary];
+    });
+    static BOOL sScanned = NO;
+    if (sScanned) return;
+    sScanned = YES;
+    SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)count);
+    if (!classes) return;
+    count = objc_getClassList(classes, count);
+    int hooked = 0;
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (!cls) continue;
+        if (!chatmenu_classOverridesSelector(cls, editSel)) continue; // 仅自身实现的类
+        if (!chatmenu_isAppClass(cls)) continue;                       // 含动态类放行
+        NSString *key = [NSString stringWithFormat:@"enumm_%s", class_getName(cls)];
+        if ([gEditMenuHookedClasses containsObject:key]) continue;
+        [gEditMenuHookedClasses addObject:key];
+        IMP orig = NULL;
+        MSHookMessageEx(cls, editSel, (IMP)chatmenu_editMenuReplacement, &orig);  // PAC 安全
+        if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(cls)];
+        chatmenu_log([NSString stringWithFormat:@"[enumMenu] hooked class=%s orig=%@",
+                      class_getName(cls), orig ? @"YES" : @"NO"]);
+        hooked++;
+    }
+    free(classes);
+    chatmenu_log([NSString stringWithFormat:@"[enumMenu] scan done hooked=%d", hooked]);
 }
 
 // ==================== 共享 pan delegate：允许与原生文本选择手势并存 ====================
@@ -534,6 +576,7 @@ static void chatswipe_paste(UIView *view) {
         // 懒加载 hook 该输入框真实类的 editMenuInteraction（删子类 App 自定义项：换行/全屏输入 等）
         chatmenu_hookEditMenuForClassIfNeeded(object_getClass(self));
         chatmenu_hookTextMenuDelegateIfNeeded(self);
+        chatmenu_hookAllEditMenuClassesIfNeeded();
         return YES; // 三件套：强制显示 + 可用
     }
     return NO; // 其余（含 scanDocument 扫描文本）一律不显示
@@ -610,6 +653,7 @@ static void chatswipe_paste(UIView *view) {
     if (chatmenu_isAllowedAction(action)) {
         chatmenu_hookEditMenuForClassIfNeeded(object_getClass(self));
         chatmenu_hookTextMenuDelegateIfNeeded(self);
+        chatmenu_hookAllEditMenuClassesIfNeeded();
         return YES; // 三件套：强制显示 + 可用
     }
     return NO; // 其余（含 scanDocument 扫描文本）一律不显示
@@ -675,6 +719,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.6 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.7 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
