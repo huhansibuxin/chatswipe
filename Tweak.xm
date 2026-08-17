@@ -86,6 +86,24 @@ static id chatmenu_filterMenu(id menu) {
     return [menuCls performSelector:@selector(menuWithChildren:) withObject:keep];
 }
 
+// v1.3.6：UIMenuController 路径（QQ 单击输入框弹出的菜单疑似走老 API UIMenuController，而非
+// iOS16 UIEditMenuInteraction——v1.3.5 实测 editMenuInteraction: 不触发）。自定义项（换行/全屏输入）
+// 通过 setMenuItems: 设置，这里按 action 白名单过滤：只留 粘贴/复制/全选，其余（换行/全屏输入等）丢弃。
+static NSArray *chatmenu_filterMenuItems(NSArray *items) {
+    if (!items) return items;
+    NSMutableArray *keep = [NSMutableArray array];
+    for (id item in items) {
+        SEL a = ((SEL (*)(id, SEL))objc_msgSend)(item, @selector(action));
+        if (chatmenu_isAllowedAction(a)) {
+            [keep addObject:item];
+        } else {
+            chatmenu_log([NSString stringWithFormat:@"[ucMenu] drop item action=%@",
+                          NSStringFromSelector(a)]);
+        }
+    }
+    return keep;
+}
+
 static void chatswipe_loadConfig() {
     @try {
         NSString *path = @"/var/mobile/Documents/chatswipe.plist";
@@ -282,6 +300,23 @@ static void chatmenu_hookTextMenuDelegateIfNeeded(id input) {
     }
     chatmenu_log([NSString stringWithFormat:@"[textMenu] hooked delegate=%@ orig=%@",
                   NSStringFromClass(dcls), orig ? @"YES" : @"NO"]);
+
+    // v1.3.5：delegate 类若 override 了 editMenuInteraction:（QQ 菜单 delegate 走这一层而非
+    // textView:editMenuForTextRange:，v1.3.4 实测 not-override 已证明），一并懒加载 hook 过滤。
+    SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
+    if (chatmenu_classOverridesSelector(dcls, editSel)) {
+        NSString *k2 = [NSString stringWithFormat:@"editdelegate_%@", NSStringFromClass(dcls)];
+        if (![gEditMenuHookedClasses containsObject:k2]) {
+            [gEditMenuHookedClasses addObject:k2];
+            IMP eorig = NULL;
+            MSHookMessageEx(dcls, editSel, (IMP)chatmenu_editMenuReplacement, &eorig);  // PAC 安全
+            if (eorig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)eorig] forKey:NSStringFromClass(dcls)];
+            chatmenu_log([NSString stringWithFormat:@"[delegateMenu] hooked delegate=%@ orig=%@",
+                          NSStringFromClass(dcls), eorig ? @"YES" : @"NO"]);
+        }
+    } else {
+        chatmenu_log([NSString stringWithFormat:@"[delegateMenu] skip not-override delegate=%@", NSStringFromClass(dcls)]);
+    }
 }
 
 // ==================== 共享 pan delegate：允许与原生文本选择手势并存 ====================
@@ -422,6 +457,62 @@ static void chatswipe_paste(UIView *view) {
         }
         return arr;
     } @catch (id e) { return orig; }
+}
+
+// v1.3.5：全局拦截 editMenuInteraction:menuForConfiguration:suggestedActions:（iOS16 菜单生成核心入口）。
+// 日志确认 self=谁在实现（输入框 / coordinator / VC），并只对"关联输入框"的菜单过滤
+//（config.sourceView/editView 判定，全程 respondsToSelector + objc_msgSend + try/catch），
+// 其他菜单（图片/链接长按等）原样放行，避免误伤。
+- (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
+    id result = %orig;
+    if (!gMenuFilterEnabled) return result;
+    @try {
+        BOOL isInput = NO;
+        if (configuration && [configuration respondsToSelector:@selector(editView)]) {
+            id v = ((id (*)(id, SEL))objc_msgSend)(configuration, @selector(editView));
+            if (v && ([v isKindOfClass:[UITextView class]] || [v isKindOfClass:[UITextField class]])) isInput = YES;
+        }
+        if (!isInput && configuration && [configuration respondsToSelector:@selector(sourceView)]) {
+            id v = ((id (*)(id, SEL))objc_msgSend)(configuration, @selector(sourceView));
+            if (v && ([v isKindOfClass:[UITextView class]] || [v isKindOfClass:[UITextField class]])) isInput = YES;
+        }
+        chatmenu_log([NSString stringWithFormat:@"[nsmenu] self=%@ isInput=%d",
+                      NSStringFromClass([self class]), isInput]);
+        Class menuCls = NSClassFromString(@"UIMenu");
+        if (isInput && menuCls && [result isKindOfClass:menuCls]) {
+            NSArray *ch = [result valueForKey:@"children"];
+            chatmenu_log([NSString stringWithFormat:@"[nsmenu] children=%lu", (unsigned long)ch.count]);
+            for (id el in ch) {
+                NSString *extra = @"";
+                if ([el respondsToSelector:@selector(title)]) extra = [el title] ?: @"";
+                if ([el isKindOfClass:NSClassFromString(@"UICommand")]) {
+                    SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+                    extra = [extra stringByAppendingFormat:@" cmd:%@", NSStringFromSelector(a)];
+                }
+                chatmenu_log([NSString stringWithFormat:@"[nsmenu]  - %@ %@", [el class], extra]);
+            }
+        }
+        if (isInput) return chatmenu_filterMenu(result);
+    } @catch (id e) {}
+    return result;
+}
+%end
+
+// v1.3.6：UIMenuController（老 API，单击输入框聚焦弹菜单的自定义项走这里）。
+// 过滤 setMenuItems: 传入的自定义项（换行/全屏输入等），粘贴/复制/全选由系统按 canPerformAction 显示（已 hook）。
+%hook UIMenuController
+- (void)setMenuItems:(NSArray *)items {
+    if (!gMenuFilterEnabled) { %orig; return; }
+    @try {
+        NSArray *filtered = chatmenu_filterMenuItems(items);
+        if (filtered.count != items.count) {
+            chatmenu_log([NSString stringWithFormat:@"[ucMenu] setMenuItems %lu -> %lu",
+                          (unsigned long)items.count, (unsigned long)filtered.count]);
+            %orig(filtered);
+            return;
+        }
+    } @catch (id e) {}
+    %orig;
 }
 %end
 
@@ -584,6 +675,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.4 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.6 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
