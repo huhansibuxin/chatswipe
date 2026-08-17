@@ -190,11 +190,11 @@ static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id con
     BOOL isTextInputMenu = NO;
     @try {
         if (config && [config respondsToSelector:@selector(editView)]) {
-            id src = [config editView];
+            id src = ((id (*)(id, SEL))objc_msgSend)(config, @selector(editView));
             if (src && ([src isKindOfClass:[UITextView class]] || [src isKindOfClass:[UITextField class]])) isTextInputMenu = YES;
         }
         if (!isTextInputMenu && config && [config respondsToSelector:@selector(sourceView)]) {
-            id src = [config sourceView];
+            id src = ((id (*)(id, SEL))objc_msgSend)(config, @selector(sourceView));
             if (src && ([src isKindOfClass:[UITextView class]] || [src isKindOfClass:[UITextField class]])) isTextInputMenu = YES;
         }
     } @catch (id e) {}
@@ -493,7 +493,7 @@ static void chatswipe_paste(UIView *view) {
     // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
     @try {
         NSString *path = @"/var/jb/tmp/chatswipe_loaded.log";
-        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.5 loaded %@\n", [NSDate date]];
+        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.6 loaded %@\n", [NSDate date]];
         [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
