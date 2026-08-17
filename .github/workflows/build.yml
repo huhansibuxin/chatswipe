@@ -9,7 +9,9 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        run: |
+          # 手动 git clone，绕过 actions/checkout 在 GitHub 限流(codeload 429/502/503)时下载失败的问题
+          git clone --depth 1 --branch main https://github.com/huhansibuxin/chatswipe.git .
 
       - name: Setup Theos
         run: |
@@ -24,7 +26,12 @@ jobs:
       - name: Install SDK
         run: |
           cd ${{ runner.temp }}/theos/sdks
-          curl -sLO https://github.com/theos/sdks/archive/refs/heads/master.zip
+          for i in 1 2 3 4 5; do
+            curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o master.zip
+            if unzip -tq master.zip >/dev/null 2>&1; then break; fi
+            echo "SDK zip bad, retry $i"
+            sleep 8
+          done
           unzip -q master.zip
           mv sdks-master/iPhoneOS16.5.sdk .
           rm -rf sdks-master master.zip
