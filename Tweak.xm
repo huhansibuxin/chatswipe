@@ -386,6 +386,39 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
+// v1.5.2：恢复 UIMenuController 打标——确认 QQ 是否走老 API UIMenuController 显示菜单。
+%hook UIMenuController
+- (void)setMenuVisible:(BOOL)visible animated:(BOOL)animated {
+    chatmenu_log([NSString stringWithFormat:@"[ucVisible] visible=%d", visible]);
+    %orig;
+}
+- (void)update {
+    chatmenu_log(@"[ucUpdate2] called");
+    %orig;
+}
+%end
+
+// v1.5.2：菜单 view 探测——打印类名含 Menu/EditMenu/ContextMenu/Popup/Sheet/Assistant/EditingOverlay 的新 view，
+// 判断菜单是系统 view（_UI...Menu...）还是 QQ 自绘 view（NTAIO.../QQ...）。
+%hook UIView
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window) {
+        static int sCnt = 0;
+        if (sCnt < 500) {
+            NSString *cn = NSStringFromClass([self class]);
+            NSRange r = [cn rangeOfString:@"Menu|EditMenu|ContextMenu|Popup|Sheet|Assistant|EditingOverlay|Editing"
+                                  options:NSRegularExpressionSearch];
+            if (r.location != NSNotFound) {
+                sCnt++;
+                chatmenu_log([NSString stringWithFormat:@"[menuView] %@ (super=%@)",
+                              cn, NSStringFromClass([[self superview] class])]);
+            }
+        }
+    }
+}
+%end
+
 %ctor {
     chatswipe_loadConfig();
     // 清除上一版本日志 + 写加载标记（写 App 沙盒 Documents，SSH 可 cat：
@@ -395,6 +428,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.1 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.2 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
