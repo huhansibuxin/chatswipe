@@ -570,6 +570,19 @@ static void chatswipe_paste(UIView *view) {
     if (self.window) chatswipe_attachIfNeeded(self);
 }
 
+// v1.3.8：QQ 的"换行/全屏输入"若挂在键盘辅助条（inputAssistantItem）上则清空其按钮组。
+- (id)inputAssistantItem {
+    id item = %orig;
+    if (gMenuFilterEnabled && item) {
+        @try {
+            [item setValue:@[] forKey:@"leadingBarButtonGroups"];
+            [item setValue:@[] forKey:@"trailingBarButtonGroups"];
+            chatmenu_log(@"[assist] cleared");
+        } @catch (id e) {}
+    }
+    return item;
+}
+
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
     if (chatmenu_isAllowedAction(action)) {
@@ -646,6 +659,19 @@ static void chatswipe_paste(UIView *view) {
     if (self.window) chatswipe_attachIfNeeded(self);
 }
 
+// v1.3.8：QQ 的"换行/全屏输入"若挂在键盘辅助条（inputAssistantItem）上则清空其按钮组。
+- (id)inputAssistantItem {
+    id item = %orig;
+    if (gMenuFilterEnabled && item) {
+        @try {
+            [item setValue:@[] forKey:@"leadingBarButtonGroups"];
+            [item setValue:@[] forKey:@"trailingBarButtonGroups"];
+            chatmenu_log(@"[assist] cleared");
+        } @catch (id e) {}
+    }
+    return item;
+}
+
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (!gMenuFilterEnabled) return %orig;
     // 密码框不强制 复制/全选（防泄密），但 粘贴 仍允许
@@ -719,6 +745,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.7 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.8 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
