@@ -65,6 +65,12 @@ static id chatmenu_filterMenu(id menu) {
 
 static NSMutableSet *gHookedClasses = nil;
 
+// 保存每个被 hook 类的 editMenuInteraction: 原始 IMP（key = 类名），KVO 子类继承后可用 superclass 链回查。
+static NSMutableDictionary *gEditMenuOrig = nil;
+
+// 前向声明：chatmenu_editMenuReplacement 在下方 chatmenu_hookTextViewSubclasses 中即被引用
+static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested);
+
 static BOOL chatmenu_classOverridesSelector(Class cls, SEL sel) {
     unsigned int n = 0;
     Method *methods = class_copyMethodList(cls, &n);
@@ -166,9 +172,6 @@ static void chatmenu_hookTextViewSubclasses() {
 // imp_implementationWithBlock 直接换。原因：iOS 16 ARM64e 指针认证(PAC) 下，被 hook 的类若是 UIKit
 // 系统内部类，直接换 IMP 会因 PAC 签名不匹配而 BRK 崩溃（v1.2.1 因此闪退）。MSHookMessageEx 内部
 // 会正确处理 PAC resign，对任意类（含系统类）都安全。
-
-// 保存每个被 hook 类的原始 IMP（key = 类名），KVO 子类继承方法后可用 superclass 链回查。
-static NSMutableDictionary *gEditMenuOrig = nil;
 
 // 沿 superclass 链查找被 hook 类的原始 IMP（兼容 KVO 子类：实例 class 是 NSKVONotifying_XXX）
 static IMP chatmenu_lookupOrig(Class cls) {
