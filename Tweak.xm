@@ -558,6 +558,61 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
+// ==================== v1.3.9 运行时探测（QQ 自绘菜单定位） ====================
+// QQ 加密 + 自绘菜单：frida attach 被拒（incompatible Mach-O image），改用 dylib 自探。
+// hook UIButton.setTitle / UIMenuItem / didMoveToWindow / presentViewController，
+// 老板单击输入框后日志直接暴露菜单按钮 title/类/action，据此写精准过滤。
+%hook UIButton
+- (void)setTitle:(NSString *)title forState:(UIControlState)state {
+    %orig;
+    if (gMenuFilterEnabled && title.length > 0) {
+        @try {
+            if ([title containsString:@"换行"] || [title containsString:@"全屏"] ||
+                [title containsString:@"拷贝"] || [title containsString:@"粘贴"] ||
+                [title containsString:@"全选"] || [title containsString:@"复制"]) {
+                chatmenu_log([NSString stringWithFormat:@"[btn] setTitle=%@ class=%@", title, NSStringFromClass([self class])]);
+            }
+        } @catch (id e) {}
+    }
+}
+%end
+
+%hook UIMenuItem
+- (instancetype)initWithTitle:(NSString *)title action:(SEL)action {
+    id r = %orig;
+    if (gMenuFilterEnabled) {
+        @try {
+            chatmenu_log([NSString stringWithFormat:@"[uItem] init title=%@ action=%@", title, NSStringFromSelector(action)]);
+        } @catch (id e) {}
+    }
+    return r;
+}
+%end
+
+%hook UIView
+- (void)didMoveToWindow {
+    %orig;
+    if (gMenuFilterEnabled && self.window) {
+        static int sCnt = 0;
+        if (sCnt < 300) {
+            sCnt++;
+            chatmenu_log([NSString stringWithFormat:@"[view] %@ (super=%@)", NSStringFromClass([self class]), NSStringFromClass([[self superview] class])]);
+        }
+    }
+}
+%end
+
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)vcToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    %orig;
+    if (gMenuFilterEnabled) {
+        @try {
+            chatmenu_log([NSString stringWithFormat:@"[present] %@ -> %@", NSStringFromClass([self class]), NSStringFromClass([vcToPresent class])]);
+        } @catch (id e) {}
+    }
+}
+%end
+
 %hook UITextView
 - (BOOL)becomeFirstResponder {
     BOOL r = %orig;
@@ -745,6 +800,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.8 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.9 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
