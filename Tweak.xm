@@ -12,6 +12,17 @@ static BOOL     gEnabled     = YES;   // 总开关
 static BOOL     gClearEnabled= YES;   // 左滑清空
 static BOOL     gPasteEnabled= YES;   // 右滑粘贴
 static CGFloat  gThreshold   = 45.0;  // 触发所需最小水平位移(pt)
+static BOOL     gMenuFilterEnabled = YES; // 编辑菜单精简总开关（只留 粘贴/复制/全选）
+
+// 编辑菜单白名单：仅允许这三类动作出现在输入框长按/单击菜单中。
+// 其余（剪切、选择、替换、查找、翻译、分享、以及系统"扫描文本" scanDocument: 等）+ App 自定义项
+//（微信 #话题/搜一搜、QQ 换行/全屏输入、备忘录 格式/查找）一律移除。
+static BOOL chatmenu_isAllowedAction(SEL action) {
+    if (action == @selector(paste:))     return YES;
+    if (action == @selector(copy:))      return YES;
+    if (action == @selector(selectAll:)) return YES;
+    return NO;
+}
 
 static void chatswipe_loadConfig() {
     @try {
@@ -22,6 +33,7 @@ static void chatswipe_loadConfig() {
             if ([cfg objectForKey:@"ClearEnabled"])  gClearEnabled = [[cfg objectForKey:@"ClearEnabled"]  boolValue];
             if ([cfg objectForKey:@"PasteEnabled"])  gPasteEnabled = [[cfg objectForKey:@"PasteEnabled"]  boolValue];
             if ([cfg objectForKey:@"Threshold"])     gThreshold    = [[cfg objectForKey:@"Threshold"]     floatValue];
+            if ([cfg objectForKey:@"MenuFilterEnabled"]) gMenuFilterEnabled = [[cfg objectForKey:@"MenuFilterEnabled"] boolValue];
         }
     } @catch (id e) {}
 }
@@ -118,6 +130,76 @@ static void chatswipe_paste(UIView *view) {
     else       { if (gPasteEnabled)  chatswipe_paste(self);  }
 }
 @end
+
+// ==================== 编辑菜单精简（老板需求） ====================
+// 点击/长按输入框弹出的编辑菜单，各 App 内容不一：微信 #话题/搜一搜、QQ 换行/全屏输入、
+// 备忘录 格式/查找，以及系统"扫描文本"(scanDocument:)。统一成只显示三项：
+//   粘贴(paste:) / 复制(copy:) / 全选(selectAll:)
+// 两层拦截：
+//   1) canPerformAction:withSender: —— 决定每个动作是否可选，挡掉 App 自定义项与系统扫描文本；
+//   2) buildMenuWithBuilder:        —— iOS 13+ 改用 UIMenu 构建菜单，再物理移除非白名单项。
+// 只 hook 输入框(UITextView/UITextField)，避免误伤 App 其他菜单（如长按消息气泡的 转发/删除）。
+// 本 dylib 由 TrollFools 注入目标 App，故仅在被注入 App 内生效（不注入 SpringBoard）。
+
+%hook UITextView
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (gMenuFilterEnabled && chatmenu_isAllowedAction(action)) return %orig; // 白名单：沿用系统可用态
+    if (gMenuFilterEnabled) return NO;                                        // 其余一律不显示
+    return %orig;
+}
+
+- (void)buildMenuWithBuilder:(id)builder {
+    %orig;
+    if (!gMenuFilterEnabled) return;
+    if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
+        @try {
+            NSString *editId = @"com.apple.menu.identifier.edit";
+            [builder replaceChildrenOfMenuForIdentifier:editId withChildren:^NSArray *(NSArray *children) {
+                NSMutableArray *keep = [NSMutableArray array];
+                Class cmdCls = NSClassFromString(@"UICommand");
+                for (id el in children) {
+                    if ([el isKindOfClass:[UIMenu class]]) continue; // 丢弃所有子菜单（替换/分享/查找 等下拉）
+                    if (cmdCls && [el isKindOfClass:cmdCls]) {
+                        SEL a = (SEL)[el performSelector:@selector(action)];
+                        if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+                    }
+                }
+                return keep;
+            }];
+        } @catch (id e) {}
+    }
+}
+%end
+
+%hook UITextField
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (gMenuFilterEnabled && chatmenu_isAllowedAction(action)) return %orig;
+    if (gMenuFilterEnabled) return NO;
+    return %orig;
+}
+
+- (void)buildMenuWithBuilder:(id)builder {
+    %orig;
+    if (!gMenuFilterEnabled) return;
+    if ([builder respondsToSelector:@selector(replaceChildrenOfMenuForIdentifier:withChildren:)]) {
+        @try {
+            NSString *editId = @"com.apple.menu.identifier.edit";
+            [builder replaceChildrenOfMenuForIdentifier:editId withChildren:^NSArray *(NSArray *children) {
+                NSMutableArray *keep = [NSMutableArray array];
+                Class cmdCls = NSClassFromString(@"UICommand");
+                for (id el in children) {
+                    if ([el isKindOfClass:[UIMenu class]]) continue;
+                    if (cmdCls && [el isKindOfClass:cmdCls]) {
+                        SEL a = (SEL)[el performSelector:@selector(action)];
+                        if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+                    }
+                }
+                return keep;
+            }];
+        } @catch (id e) {}
+    }
+}
+%end
 
 // ==================== Hook：输入框成为第一响应者时挂手势 ====================
 %hook UITextView
