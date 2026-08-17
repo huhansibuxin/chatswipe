@@ -144,9 +144,9 @@ static void chatswipe_paste(UIView *view) {
 
 %hook UITextView
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (gMenuFilterEnabled && chatmenu_isAllowedAction(action)) return %orig; // 白名单：沿用系统可用态
-    if (gMenuFilterEnabled) return NO;                                        // 其余一律不显示
-    return %orig;
+    if (!gMenuFilterEnabled) return %orig;
+    if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用（不依赖系统当前选中态）
+    return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
 }
 
 - (void)buildMenuWithBuilder:(id)builder {
@@ -179,9 +179,11 @@ static void chatswipe_paste(UIView *view) {
 
 %hook UITextField
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (gMenuFilterEnabled && chatmenu_isAllowedAction(action)) return %orig;
-    if (gMenuFilterEnabled) return NO;
-    return %orig;
+    if (!gMenuFilterEnabled) return %orig;
+    // 密码框不强制 复制/全选（防泄密），但 粘贴 仍允许
+    if ((action == @selector(copy:) || action == @selector(selectAll:)) && self.secureTextEntry) return %orig;
+    if (chatmenu_isAllowedAction(action)) return YES; // 三件套：强制显示 + 可用
+    return NO;                                        // 其余（含 scanDocument 扫描文本）一律不显示
 }
 
 - (void)buildMenuWithBuilder:(id)builder {
