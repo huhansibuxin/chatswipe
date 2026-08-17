@@ -1,6 +1,6 @@
 Package: com.huhansibuxin.chatswipe
 Name: ChatSwipe
-Version: 1.1.1
+Version: 1.1.3
 Architecture: iphoneos-arm64
 Description: 通用聊天输入框滑动手势：左滑清空 / 右滑粘贴；并精简输入框编辑菜单为 粘贴/复制/全选（微信/QQ/Telegram/抖音 通用）
 Maintainer: huhansibuxin

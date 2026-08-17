@@ -188,7 +188,8 @@ static void chatswipe_paste(UIView *view) {
 // iOS 16 主拦截点：App 自定义项在这里以 UIAction 追加。对最终 UIMenu 递归过滤。
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
-    return chatmenu_filterMenu(%orig);
+    id origMenu = %orig;
+    return chatmenu_filterMenu(origMenu);
 }
 
 // 兜底：iOS 13–15 旧路径（UIMenuController + UIMenuBuilder）；iOS 16 多走上面 editMenuInteraction。
@@ -231,7 +232,8 @@ static void chatswipe_paste(UIView *view) {
 
 - (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
     if (!gMenuFilterEnabled) return %orig;
-    return chatmenu_filterMenu(%orig);
+    id origMenu = %orig;
+    return chatmenu_filterMenu(origMenu);
 }
 
 - (void)buildMenuWithBuilder:(id)builder {
