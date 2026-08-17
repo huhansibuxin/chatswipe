@@ -414,30 +414,32 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
-// ==================== 现代路径 A：UIEditMenuInteraction 的 delegate（部分 App） ====================
+// ==================== 现代路径 A：UIEditMenuInteraction 的 delegate（系统类也要 hook） ====================
 // QQ 实测用 initWithDelegate: 设 delegate（init 时即设，setDelegate: 不一定被调用），故两个入口都捕获。
-// 该 delegate 即 UIKit 用来构建编辑菜单的对象，其
-// editMenuInteraction:menuForConfiguration:suggestedActions: 返回 UIMenu（决定内容与顺序）。
-// 仅 hook App 类（PAC 安全）；系统类只记类名便于诊断；输入框本身（delegate=文本框）交给
-// %hook UITextView/UITextField 处理，避免双重 hook。
-static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
-    if (!gMenuFilterEnabled || !delegate) return;
-    Class dcls = [delegate class];
+// 该 delegate 即真正构建编辑菜单的对象，其 editMenuInteraction:menuForConfiguration:suggestedActions:
+// 返回 UIMenu（决定内容+顺序）。
+// ★ 关键：iOS16 标准文本框编辑菜单的构建者就是 UIKit 系统类
+//   _UIContextMenuInteractionBasedTextContextInteraction（delegate 是它，不是文本框、也不是 App 类）。
+//   canPerformAction 只管显隐，顺序由这个系统类的方法写死 → 必须 hook 它才能排序/过滤。
+//   故不再跳过系统类：用 class_addMethod 在该类上加覆盖（仅影响该类、不污染 UIKit 父类全局 IMP；
+//   运行时对新增 IMP 做 PAC 签名，PAC 安全）。%ctor 还会按类名直接 hook 该系统类兜底。
+static void chatmenu_hookEditMenuDelegateClass(Class dcls) {
+    if (!gMenuFilterEnabled || !dcls) return;
     NSString *key = NSStringFromClass(dcls);
     if ([gEditMenuHooked containsObject:key]) return;
     [gEditMenuHooked addObject:key];
     BOOL isApp = chatmenu_isAppClass(dcls);
     chatmenu_log([NSString stringWithFormat:@"[emiDelegate] seen %@ isApp=%d", key, isApp ? 1 : 0]);
-    if (!isApp) return; // 系统类（UIKit 内部 assistant 等）→ 仅记录类名，后续按需 hook
-    if ([delegate isKindOfClass:[UITextView class]] ||
-        [delegate isKindOfClass:[UITextField class]]) {
-        return; // 输入框本身由 %hook UITextView/UITextField 处理，避免双重 hook
+    // 文本框自身由 %hook UITextView/UITextField 处理，避免双重 hook
+    if ([dcls isSubclassOfClass:[UITextView class]] ||
+        [dcls isSubclassOfClass:[UITextField class]]) {
+        return;
     }
     SEL sel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
     Method m = class_getInstanceMethod(dcls, sel);
     if (!m) { chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip no-method %@", key]); return; }
     IMP newImp = (IMP)chatmenu_editMenuReplacement;
-    // 该类自身是否实现该方法？（避免 class_containsMethod 在某些 SDK 未声明）
+    // 该类自身是否实现该方法？（避免 class_containsMethod 在某些 SDK 未声明，用 class_copyMethodList 判断）
     BOOL ownMethod = NO;
     unsigned int mc = 0;
     Method *mlist = class_copyMethodList(dcls, &mc);
@@ -446,12 +448,12 @@ static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
     }
     if (mlist) free(mlist);
     if (ownMethod) {
-        // 类自身实现该方法 → 直接替换 IMP（仅影响该类，安全）
+        // 类自身实现 → 直接替换 IMP（仅影响该类，安全）
         IMP orig = method_setImplementation(m, newImp);
         if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
         chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked(self) %@ orig=%d", key, orig ? 1 : 0]);
     } else {
-        // 继承自父类（UIKit）→ 在子类上 addMethod 覆盖，避免污染父类全局 IMP
+        // 继承自父类（UIKit）→ 在该类上 addMethod 覆盖，避免污染父类全局 IMP
         IMP orig = method_getImplementation(m); // 父类（UIKit）实现
         if (class_addMethod(dcls, sel, newImp, method_getTypeEncoding(m))) {
             if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
@@ -460,6 +462,11 @@ static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
             chatmenu_log([NSString stringWithFormat:@"[emiDelegate] addMethod-fail %@", key]);
         }
     }
+}
+
+static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
+    if (!delegate) return;
+    chatmenu_hookEditMenuDelegateClass([delegate class]);
 }
 
 %hook UIEditMenuInteraction
@@ -523,5 +530,8 @@ static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.7 loaded %@", [NSDate date]]);
+    // 直接 hook iOS16 文本框编辑菜单的标准构建者（UIKit 系统类），兜底不依赖 initWithDelegate 捕获
+    Class sysEditCls = NSClassFromString(@"_UIContextMenuInteractionBasedTextContextInteraction");
+    if (sysEditCls) chatmenu_hookEditMenuDelegateClass(sysEditCls);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.8 loaded %@", [NSDate date]]);
 }
