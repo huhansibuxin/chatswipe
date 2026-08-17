@@ -351,6 +351,28 @@ static void chatswipe_paste(UIView *view) {
 }
 %end
 
+// ==================== 全局拦截 editMenuInteraction delegate（关键修复） ====================
+// iOS 16 下 UIEditMenuInteraction 的 delegate 通常【不是】UITextView/UITextField 本身，
+// 而是 App 的 ViewController / Coordinator 等对象。所以挂在基类上的
+// editMenuInteraction:menuForConfiguration:suggestedActions: 永远不会被调用到，
+// 导致 #话题/搜一搜/换行/全屏输入 等 App 自定义项无法被过滤（v1.1.x 实测如此）。
+// 解决方案：把该方法挂到 NSObject 上，无论谁是 delegate 都能拦截；
+// 再通过 interaction.view 判断关联的是否为输入框，避免误伤其他菜单（图片长按等）。
+%hook NSObject
+- (id)editMenuInteraction:(id)interaction menuForConfiguration:(id)configuration suggestedActions:(NSArray *)suggestedActions {
+    id result = %orig;
+    if (!gMenuFilterEnabled || !result) return result;
+    @try {
+        // 只过滤"文本输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
+        id view = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(view));
+        if (view && ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]])) {
+            return chatmenu_filterMenu(result);
+        }
+    } @catch (id e) {}
+    return result;
+}
+%end
+
 // ==================== Hook：输入框成为第一响应者时挂手势 ====================
 %hook UITextView
 - (BOOL)becomeFirstResponder {
@@ -390,15 +412,12 @@ static void chatswipe_paste(UIView *view) {
         chatmenu_hookTextViewSubclasses();
     });
     // 加载验证：写文件标记，确认 dylib 被 TrollFools 注入并加载（iOS 16 rootless 世界 /var/jb/tmp 可写）。
+    // 每次新版本覆盖写入（不清除旧日志的话多版本叠加难以辨认）。
     // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
     @try {
         NSString *path = @"/var/jb/tmp/chatswipe_loaded.log";
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        [fh seekToEndOfFile];
-        [fh writeData:[[NSString stringWithFormat:@"loaded %@\n", [NSDate date]] dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
+        NSString *msg = [NSString stringWithFormat:@"chatswipe v1.2.0 loaded %@\n", [NSDate date]];
+        [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
