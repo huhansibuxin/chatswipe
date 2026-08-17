@@ -437,7 +437,15 @@ static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
     Method m = class_getInstanceMethod(dcls, sel);
     if (!m) { chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip no-method %@", key]); return; }
     IMP newImp = (IMP)chatmenu_editMenuReplacement;
-    if (class_containsMethod(dcls, sel)) {
+    // 该类自身是否实现该方法？（避免 class_containsMethod 在某些 SDK 未声明）
+    BOOL ownMethod = NO;
+    unsigned int mc = 0;
+    Method *mlist = class_copyMethodList(dcls, &mc);
+    for (unsigned int i = 0; i < mc; i++) {
+        if (method_getName(mlist[i]) == sel) { ownMethod = YES; break; }
+    }
+    if (mlist) free(mlist);
+    if (ownMethod) {
         // 类自身实现该方法 → 直接替换 IMP（仅影响该类，安全）
         IMP orig = method_setImplementation(m, newImp);
         if (orig) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
