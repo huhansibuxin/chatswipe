@@ -7,6 +7,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
+#import <substrate.h>   // MSHookMessageEx：Logos 底层，ARM64e PAC 安全替换 IMP（系统类也不崩）
 
 // ==================== 配置（可选 /var/mobile/Documents/chatswipe.plist） ====================
 static BOOL     gEnabled     = YES;   // 总开关
@@ -144,11 +145,48 @@ static void chatmenu_hookTextViewSubclasses() {
 }
 
 // ==================== 精准 hook 输入框 edit menu 的 delegate（不碰 NSObject） ====================
-// iOS 16 的 UIEditMenuInteraction delegate 通常是 App 的 VC/Coordinator，不是输入框本身，
-// 所以挂在 UITextView/UITextField 上的 editMenuInteraction:... 不会被调用。
+// iOS 16 的 UIEditMenuInteraction delegate 通常是 App 的 VC/Coordinator（甚至 UIKit 系统内部对象），
+// 不是输入框本身，所以挂在 UITextView/UITextField 上的 editMenuInteraction:... 不会被调用。
 // 这里只针对"输入框"：从其内部 editMenuInteraction 拿到真正的 delegate 对象，
 // 仅替换【那个 delegate 类】的 editMenuInteraction:menuForConfiguration:suggestedActions:，
 // 绝不动 NSObject，也不会影响其他对象。内部仍用 interaction.view 判断关联的是否为输入框。
+//
+// ⚠️ 必须用 MSHookMessageEx（ElleKit / Logos 底层）替换 IMP，绝不能用 method_setImplementation +
+// imp_implementationWithBlock 直接换。原因：iOS 16 ARM64e 指针认证(PAC) 下，被 hook 的类若是 UIKit
+// 系统内部类，直接换 IMP 会因 PAC 签名不匹配而 BRK 崩溃（v1.2.1 因此闪退）。MSHookMessageEx 内部
+// 会正确处理 PAC resign，对任意类（含系统类）都安全。
+
+// 保存每个被 hook 类的原始 IMP（key = 类名），KVO 子类继承方法后可用 superclass 链回查。
+static NSMutableDictionary *gEditMenuOrig = nil;
+
+// 沿 superclass 链查找被 hook 类的原始 IMP（兼容 KVO 子类：实例 class 是 NSKVONotifying_XXX）
+static IMP chatmenu_lookupOrig(Class cls) {
+    Class c = cls;
+    while (c) {
+        NSValue *v = [gEditMenuOrig objectForKey:NSStringFromClass(c)];
+        if (v) return (IMP)[v pointerValue];
+        c = class_getSuperclass(c);
+    }
+    return NULL;
+}
+
+// 统一的 replacement（C 函数，供 MSHookMessageEx 使用；PAC 安全）
+static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested) {
+    IMP orig = chatmenu_lookupOrig(object_getClass(self));
+    if (!orig) return nil;   // 理论上不会发生（该类已被我们 hook）
+    if (!gMenuFilterEnabled) {
+        return ((id (*)(id, SEL, id, id, NSArray *))orig)(self, _cmd, interaction, config, suggested);
+    }
+    id menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, _cmd, interaction, config, suggested);
+    if (!menu) return menu;
+    // 只过滤"关联输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
+    id view = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(view));
+    if (view && ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]])) {
+        return chatmenu_filterMenu(menu);
+    }
+    return menu;
+}
+
 static void chatmenu_hookEditMenuDelegateForInput(id input) {
     if (!gMenuFilterEnabled || !input) return;
     if (![input isKindOfClass:[UITextView class]] && ![input isKindOfClass:[UITextField class]]) return;
@@ -173,30 +211,18 @@ static void chatmenu_hookEditMenuDelegateForInput(id input) {
     }
 
     NSString *key = [NSString stringWithFormat:@"editmenu_%s", class_getName(delegateClass)];
-    if ([gHookedClasses containsObject:key]) return;   // 已处理，防递归/重复
+    if ([gHookedClasses containsObject:key]) return;   // 已处理，防重复 hook 导致 orig 被二次替换（递归爆栈）
+    [gHookedClasses addObject:key];                    // 立即标记，先于实际 hook
 
     SEL editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
-    if (!chatmenu_classOverridesSelector(delegateClass, editSel)) {
-        [gHookedClasses addObject:key]; // 标记已检查，避免重复探测
-        return;
-    }
+    if (!chatmenu_classOverridesSelector(delegateClass, editSel)) return;  // 未重写则无需 hook
 
-    Method m = class_getInstanceMethod(delegateClass, editSel);
-    IMP orig = method_getImplementation(m);
-    IMP repl = imp_implementationWithBlock(^id(id self, id interaction, id config, NSArray *suggested) {
-        if (!gMenuFilterEnabled) {
-            return ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
-        }
-        id menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
-        // 只过滤"关联输入框"的编辑菜单；其他菜单（图片/链接长按等）原样放行
-        id view = ((id (*)(id, SEL))objc_msgSend)(interaction, @selector(view));
-        if (view && ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]])) {
-            return chatmenu_filterMenu(menu);
-        }
-        return menu;
-    });
-    method_setImplementation(m, repl);
-    [gHookedClasses addObject:key];
+    if (!gEditMenuOrig) gEditMenuOrig = [NSMutableDictionary dictionary];
+    IMP orig = NULL;
+    MSHookMessageEx(delegateClass, editSel, (IMP)chatmenu_editMenuReplacement, &orig);  // PAC 安全
+    if (orig) {
+        [gEditMenuOrig setObject:[NSValue valueWithPointer:orig] forKey:NSStringFromClass(delegateClass)];
+    }
 }
 
 static void chatswipe_loadConfig() {
