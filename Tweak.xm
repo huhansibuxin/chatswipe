@@ -415,41 +415,46 @@ static void chatswipe_paste(UIView *view) {
 %end
 
 // ==================== 现代路径 A：UIEditMenuInteraction 的 delegate（部分 App） ====================
+// QQ 实测用 initWithDelegate: 设 delegate（setDelegate: 不会被调用），故两个入口都捕获。
+static void chatmenu_hookEditMenuDelegateIfNeeded(id delegate) {
+    if (!gMenuFilterEnabled || !delegate) return;
+    Class dcls = [delegate class];
+    NSString *key = NSStringFromClass(dcls);
+    if ([gEditMenuHooked containsObject:key]) return;
+    [gEditMenuHooked addObject:key];
+    chatmenu_log([NSString stringWithFormat:@"[emiDelegate] seen %@ isApp=%d isInput=%d",
+                  key, chatmenu_isAppClass(dcls) ? 1 : 0,
+                  ([delegate isKindOfClass:[UITextView class]] || [delegate isKindOfClass:[UITextField class]]) ? 1 : 0]);
+    if (!chatmenu_isAppClass(dcls) ||
+        [delegate isKindOfClass:[UITextView class]] ||
+        [delegate isKindOfClass:[UITextField class]]) {
+        return; // 系统类/输入框本身跳过
+    }
+    BOOL defines = NO;
+    unsigned int mc = 0;
+    Method *mlist = class_copyMethodList(dcls, &mc);
+    for (unsigned int i = 0; i < mc; i++) {
+        if (method_getName(mlist[i]) == @selector(editMenuInteraction:menuForConfiguration:suggestedActions:)) { defines = YES; break; }
+    }
+    if (mlist) free(mlist);
+    if (defines) {
+        Method m = class_getInstanceMethod(dcls, @selector(editMenuInteraction:menuForConfiguration:suggestedActions:));
+        IMP newImp = (IMP)chatmenu_editMenuReplacement;
+        IMP origImp = method_setImplementation(m, newImp); // App 类，PAC 安全
+        if (origImp) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)origImp] forKey:key];
+        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked %@ orig=%d", key, origImp ? 1 : 0]);
+    } else {
+        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip not-override %@", key]);
+    }
+}
+
 %hook UIEditMenuInteraction
+- (instancetype)initWithDelegate:(id)delegate {
+    chatmenu_hookEditMenuDelegateIfNeeded(delegate);
+    return %orig;
+}
 - (void)setDelegate:(id)delegate {
-    if (gMenuFilterEnabled && delegate) {
-        chatmenu_log([NSString stringWithFormat:@"[emiDelegate] called %@ isApp=%d isInput=%d",
-                      NSStringFromClass([delegate class]), chatmenu_isAppClass([delegate class]) ? 1 : 0,
-                      ([delegate isKindOfClass:[UITextView class]] || [delegate isKindOfClass:[UITextField class]]) ? 1 : 0]);
-    }
-    if (gMenuFilterEnabled && delegate &&
-        chatmenu_isAppClass([delegate class]) &&
-        ![delegate isKindOfClass:[UITextView class]] &&
-        ![delegate isKindOfClass:[UITextField class]]) {
-        Class dcls = [delegate class];
-        NSString *key = NSStringFromClass(dcls);
-        if (![gEditMenuHooked containsObject:key]) {
-            [gEditMenuHooked addObject:key];
-            BOOL defines = NO;
-            unsigned int mc = 0;
-            Method *mlist = class_copyMethodList(dcls, &mc);
-            for (unsigned int i = 0; i < mc; i++) {
-                if (method_getName(mlist[i]) == @selector(editMenuInteraction:menuForConfiguration:suggestedActions:)) {
-                    defines = YES; break;
-                }
-            }
-            if (mlist) free(mlist);
-            if (defines) {
-                Method m = class_getInstanceMethod(dcls, @selector(editMenuInteraction:menuForConfiguration:suggestedActions:));
-                IMP newImp = (IMP)chatmenu_editMenuReplacement;
-                IMP origImp = method_setImplementation(m, newImp); // App 类，PAC 安全
-                if (origImp) [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)origImp] forKey:key];
-                chatmenu_log([NSString stringWithFormat:@"[emiDelegate] hooked %@ orig=%d", key, origImp ? 1 : 0]);
-            } else {
-                chatmenu_log([NSString stringWithFormat:@"[emiDelegate] skip not-override %@", key]);
-            }
-        }
-    }
+    chatmenu_hookEditMenuDelegateIfNeeded(delegate);
     %orig;
 }
 %end
@@ -504,5 +509,5 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.4 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.5.6 loaded %@", [NSDate date]]);
 }
