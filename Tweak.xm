@@ -56,6 +56,93 @@ static id chatmenu_filterMenu(id menu) {
     return [menuCls performSelector:@selector(menuWithChildren:) withObject:keep];
 }
 
+// ==================== 动态 hook 文本框子类（App 常自定义子类，如微信 WCInputTextView） ====================
+// Logos %hook 仅替换基类方法。若 App 在 UITextView/UITextField 的【子类】上重写
+// canPerformAction: / editMenuInteraction:...，基类 hook 会被绕过 → 菜单毫无变化（v1.1.1 实测如此）。
+// 故在加载时枚举所有子类，对“自身重写”了目标方法的子类逐一替换 IMP，并捕获其【原 IMP】。
+// 用 imp_implementationWithBlock 闭包捕获各自 orig，天然兼容 KVO 子类（继承到被替换的 IMP）。
+
+static NSMutableSet *gHookedClasses = nil;
+
+static BOOL chatmenu_classOverridesSelector(Class cls, SEL sel) {
+    unsigned int n = 0;
+    Method *methods = class_copyMethodList(cls, &n);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < n; i++) {
+        if (method_getName(methods[i]) == sel) { found = YES; break; }
+    }
+    if (methods) free(methods);
+    return found;
+}
+
+static void chatmenu_hookTextViewSubclasses() {
+    static SEL editSel = NULL, canSel = NULL;
+    static Class tvCls = Nil, tfCls = Nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        editSel = @selector(editMenuInteraction:menuForConfiguration:suggestedActions:);
+        canSel  = @selector(canPerformAction:withSender:);
+        tvCls = [UITextView class];
+        tfCls = [UITextField class];
+        gHookedClasses = [NSMutableSet set];
+    });
+    if (!tvCls || !tfCls) return;
+
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)count);
+    if (!classes) return;
+    count = objc_getClassList(classes, count);
+
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (!cls) continue;
+        if (cls == tvCls || cls == tfCls) continue;                 // 基类交给 Logos %hook
+        BOOL isTV = [cls isSubclassOfClass:tvCls];
+        BOOL isTF = [cls isSubclassOfClass:tfCls];
+        if (!isTV && !isTF) continue;
+
+        NSString *key = [NSString stringWithUTF8String:class_getName(cls)];
+        if ([gHookedClasses containsObject:key]) continue;          // 已 hook，防重复替换导致递归
+
+        // 1) editMenuInteraction:（iOS 16 主拦截点，App 自定义项在此以 UIAction 追加）
+        if (chatmenu_classOverridesSelector(cls, editSel)) {
+            Method m = class_getInstanceMethod(cls, editSel);
+            IMP orig = method_getImplementation(m);
+            IMP repl = imp_implementationWithBlock(^id(id self, id interaction, id config, NSArray *suggested) {
+                if (!gMenuFilterEnabled) {
+                    return ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
+                }
+                id menu = ((id (*)(id, SEL, id, id, NSArray *))orig)(self, editSel, interaction, config, suggested);
+                return chatmenu_filterMenu(menu);
+            });
+            method_setImplementation(m, repl);
+            [gHookedClasses addObject:key];
+        }
+
+        // 2) canPerformAction:（控制标准动作 粘贴/复制/全选 是否进入 suggestedActions）
+        if (chatmenu_classOverridesSelector(cls, canSel)) {
+            Method m = class_getInstanceMethod(cls, canSel);
+            IMP orig = method_getImplementation(m);
+            IMP repl = imp_implementationWithBlock(^BOOL(id self, SEL action, id sender) {
+                if (!gMenuFilterEnabled) {
+                    return ((BOOL (*)(id, SEL, SEL, id))orig)(self, canSel, action, sender);
+                }
+                // 密码框放行 复制/全选（防泄密）；其余三件套强制显示，不在白名单一律 NO
+                if (isTF && (action == @selector(copy:) || action == @selector(selectAll:)) &&
+                    ((UITextField *)self).secureTextEntry) {
+                    return ((BOOL (*)(id, SEL, SEL, id))orig)(self, canSel, action, sender);
+                }
+                if (chatmenu_isAllowedAction(action)) return YES;
+                return NO;
+            });
+            method_setImplementation(m, repl);
+            [gHookedClasses addObject:key];
+        }
+    }
+    free(classes);
+}
+
 static void chatswipe_loadConfig() {
     @try {
         NSString *path = @"/var/mobile/Documents/chatswipe.plist";
@@ -293,6 +380,15 @@ static void chatswipe_paste(UIView *view) {
 
 %ctor {
     chatswipe_loadConfig();
+    // 动态 hook 文本框子类：基类 + 未重写方法的子类由 Logos %hook 覆盖；
+    // 重写过的子类（如微信 WCInputTextView）需逐一替换 IMP，否则菜单无变化。
+    chatmenu_hookTextViewSubclasses();
+    // 二次扫描：捕获 %ctor 时尚未 realize 的懒加载子类（部分 App 延后注册类）。
+    // gHookedClasses 防重复；重复进入会因 method_setImplementation 把 block 当 orig 而递归爆栈。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        chatmenu_hookTextViewSubclasses();
+    });
     // 加载验证：写文件标记，确认 dylib 被 TrollFools 注入并加载（iOS 16 rootless 世界 /var/jb/tmp 可写）。
     // 设备端 `cat /var/jb/tmp/chatswipe_loaded.log` 能看到时间戳即说明加载成功；看不到则 dylib 没注入。
     @try {
