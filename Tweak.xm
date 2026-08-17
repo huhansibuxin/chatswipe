@@ -109,6 +109,7 @@ static void chatswipe_loadConfig() {
 //   - 时机：交互期（输入框显示 + 用户操作），非 %ctor 启动敏感期
 static NSMutableSet *gEditMenuHookedClasses = nil; // 已检查/已 hook 的类名（无论结果）
 static NSMutableDictionary *gEditMenuOrig = nil;   // key=NSStringFromClass, value=NSValue(IMP)
+static NSMutableDictionary *gTextMenuOrig = nil;   // key=NSStringFromClass, value=NSValue(IMP)  textView:editMenuForTextRange 的 orig
 
 // 前向声明：replacement 在 chatmenu_hookEditMenuForClassIfNeeded 中被引用
 static id chatmenu_editMenuReplacement(id self, SEL _cmd, id interaction, id config, NSArray *suggested);
@@ -180,6 +181,7 @@ static void chatmenu_hookEditMenuForClassIfNeeded(Class cls) {
     dispatch_once(&once, ^{
         gEditMenuHookedClasses = [NSMutableSet set];
         gEditMenuOrig = [NSMutableDictionary dictionary];
+        gTextMenuOrig = [NSMutableDictionary dictionary];
     });
     if (!cls) return;
     NSString *key = NSStringFromClass(cls);
@@ -200,6 +202,81 @@ static void chatmenu_hookEditMenuForClassIfNeeded(Class cls) {
         [gEditMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:key];
     }
     chatmenu_log([NSString stringWithFormat:@"[editMenu] hooked class=%@ orig=%@", key, orig ? @"YES" : @"NO"]);
+}
+
+// v1.3.3：App 自定义菜单项的标准注入点是 UITextViewDelegate 的
+//   textView:editMenuForTextRange:suggestedActions:（iOS16 新增，静态确认 QQ 二进制含此 selector）。
+//   该方法的实现者是【输入框的 delegate】（App 的 VC/controller），且 delegate 类通常 override 了它，
+//   所以 NSObject 基类 hook 会被绕过（v1.3.2 实测 [textMenu] 日志不出现）。
+//   正解：在 canPerformAction: 触发时拿到输入框的 delegate，对【那个具体 App 类】MSHookMessageEx
+//   hook textView:editMenuForTextRange:suggestedActions:，过滤返回的 suggestedActions 数组。
+
+// textView:editMenuForTextRange:suggestedActions: 的 replacement（C 函数，PAC 安全）
+static id chatmenu_textMenuReplacement(id self, SEL _cmd, id textView, id range, id suggestedActions) {
+    IMP orig = NULL;
+    Class c = object_getClass(self);
+    while (c) {
+        NSValue *v = [gTextMenuOrig objectForKey:NSStringFromClass(c)];
+        if (v) { orig = (IMP)[v pointerValue]; break; }
+        c = class_getSuperclass(c);
+    }
+    if (!orig) return suggestedActions;
+    id arr = nil;
+    @try { arr = ((id (*)(id, SEL, id, id, id))orig)(self, _cmd, textView, range, suggestedActions); }
+    @catch (id e) { return suggestedActions; }
+    if (!arr || ![arr isKindOfClass:[NSArray class]]) return arr;
+    NSArray *src = (NSArray *)arr;
+    NSMutableArray *keep = [NSMutableArray array];
+    Class cmdCls = NSClassFromString(@"UICommand");
+    Class actionCls = NSClassFromString(@"UIAction");
+    for (id el in src) {
+        if (cmdCls && [el isKindOfClass:cmdCls]) {
+            SEL a = ((SEL (*)(id, SEL))objc_msgSend)(el, @selector(action));
+            if (chatmenu_isAllowedAction(a)) [keep addObject:el];
+        } else if (actionCls && [el isKindOfClass:actionCls]) {
+            // App 自定义 UIAction：丢弃
+        } else {
+            [keep addObject:el];
+        }
+    }
+    if (keep.count != src.count) {
+        chatmenu_log([NSString stringWithFormat:@"[textMenu] filtered %lu -> %lu",
+                      (unsigned long)src.count, (unsigned long)keep.count]);
+        return keep;
+    }
+    return arr;
+}
+
+static void chatmenu_hookTextMenuDelegateIfNeeded(id input) {
+    if (!gMenuFilterEnabled || !input) return;
+    id delegate = nil;
+    @try {
+        if ([input respondsToSelector:@selector(delegate)]) {
+            delegate = ((id (*)(id, SEL))objc_msgSend)(input, @selector(delegate));
+        }
+    } @catch (id e) {}
+    if (!delegate) return;
+    Class dcls = object_getClass(delegate);
+    if (!dcls) return;
+    NSString *key = [NSString stringWithFormat:@"textmenu_%@", NSStringFromClass(dcls)];
+    if ([gEditMenuHookedClasses containsObject:key]) return;
+    [gEditMenuHookedClasses addObject:key]; // 先标记，防重入
+    if (!chatmenu_isAppClass(dcls)) {
+        chatmenu_log([NSString stringWithFormat:@"[textMenu] skip system delegate=%@", NSStringFromClass(dcls)]);
+        return;
+    }
+    SEL sel = @selector(textView:editMenuForTextRange:suggestedActions:);
+    if (!chatmenu_classOverridesSelector(dcls, sel)) {
+        chatmenu_log([NSString stringWithFormat:@"[textMenu] skip not-override delegate=%@", NSStringFromClass(dcls)]);
+        return; // 未 override → NSObject 基类 hook（上方 %hook NSObject）已处理
+    }
+    IMP orig = NULL;
+    MSHookMessageEx(dcls, sel, (IMP)chatmenu_textMenuReplacement, &orig);  // PAC 安全
+    if (orig) {
+        [gTextMenuOrig setObject:[NSValue valueWithPointer:(void *)orig] forKey:NSStringFromClass(dcls)];
+    }
+    chatmenu_log([NSString stringWithFormat:@"[textMenu] hooked delegate=%@ orig=%@",
+                  NSStringFromClass(dcls), orig ? @"YES" : @"NO"]);
 }
 
 // ==================== 共享 pan delegate：允许与原生文本选择手势并存 ====================
@@ -360,6 +437,7 @@ static void chatswipe_paste(UIView *view) {
     if (chatmenu_isAllowedAction(action)) {
         // 懒加载 hook 该输入框真实类的 editMenuInteraction（删子类 App 自定义项：换行/全屏输入 等）
         chatmenu_hookEditMenuForClassIfNeeded(object_getClass(self));
+        chatmenu_hookTextMenuDelegateIfNeeded(self);
         return YES; // 三件套：强制显示 + 可用
     }
     return NO; // 其余（含 scanDocument 扫描文本）一律不显示
@@ -435,6 +513,7 @@ static void chatswipe_paste(UIView *view) {
     if ((action == @selector(copy:) || action == @selector(selectAll:)) && self.secureTextEntry) return %orig;
     if (chatmenu_isAllowedAction(action)) {
         chatmenu_hookEditMenuForClassIfNeeded(object_getClass(self));
+        chatmenu_hookTextMenuDelegateIfNeeded(self);
         return YES; // 三件套：强制显示 + 可用
     }
     return NO; // 其余（含 scanDocument 扫描文本）一律不显示
@@ -500,6 +579,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.1 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.3 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
