@@ -129,7 +129,12 @@ static BOOL chatmenu_classOverridesSelector(Class cls, SEL sel) {
 static BOOL chatmenu_isAppClass(Class cls) {
     if (!cls) return NO;
     const char *img = class_getImageName(cls);
-    if (!img || !*img) return NO;
+    if (!img || !*img) {
+        // 动态生成的类（运行时创建、无 image）：QQ 的输入框 delegate 是 *_qlvr_obj_hook_* 运行时包装类，
+        // v1.3.3 把它误判成 system 跳过 → 过滤失效（换行/全屏输入残留）。动态类一律视为 App 类放行；
+        // 后续 classOverridesSelector 只会命中真正 override 目标方法的类，不会误伤。
+        return YES;
+    }
     NSString *path = [NSString stringWithUTF8String:img];
     if ([path hasPrefix:@"/System/Library/"]) return NO;
     if ([path hasPrefix:@"/Library/"])        return NO;
@@ -579,6 +584,6 @@ static void chatswipe_paste(UIView *view) {
                           stringByAppendingPathComponent:@"chatswipe.log"];
         [@"" writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
     } @catch (id e) {}
-    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.3 loaded %@", [NSDate date]]);
+    chatmenu_log([NSString stringWithFormat:@"chatswipe v1.3.4 loaded %@", [NSDate date]]);
     // app 无关：只在「本 dylib 被注入的 app」内生效（TrollFools 决定注入哪个）。
 }
