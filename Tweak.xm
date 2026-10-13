@@ -210,8 +210,8 @@ static UIImage *KbDashedIcon(NSInteger kind) {
         };
 
         if (kind == 0) {
-            // 全选：竖矩形（高 > 宽）虚线框
-            UIBezierPath *p = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(8.5, 5.0, 9.0, 16.0) cornerRadius:3.0];
+            // 全选：与「粘贴」同款的竖圆角矩形虚线框
+            UIBezierPath *p = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(7.0, 5.0, 12.0, 17.0) cornerRadius:3.0];
             prep(p); [p stroke];
         } else if (kind == 1) {
             // 复制：前后两层虚线框，两层靠拢
