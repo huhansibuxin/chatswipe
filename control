@@ -1,8 +1,8 @@
-Package: com.huhansibuxin.chatswipe
-Name: ChatSwipe
-Version: 1.5.9
+Package: com.huhansibuxin.kbdock
+Name: KbDock
+Version: 0.1.0
 Architecture: iphoneos-arm64
-Description: 通用聊天输入框滑动手势：左滑清空 / 右滑粘贴；并精简输入框编辑菜单为 粘贴/复制/全选（微信/QQ/Telegram/抖音 通用）
+Description: 键盘底部快捷条：全选 / 复制 / 粘贴（自绘虚线图标，自适应深浅色）。单 dylib，TrollFools 注入。
 Maintainer: huhansibuxin
 Author: huhansibuxin
 Section: Tweaks
