@@ -8,9 +8,16 @@
 #import <UIKit/UIKit.h>
 
 @interface UIKeyboardDockView : UIView
+- (void)kb_haptic;
+- (void)kb_selectAll;
+- (void)kb_copy;
+- (void)kb_paste;
 @end
 
 // ==================== 自绘虚线图标 ====================
+// 虚线参数放文件作用域（block 内不能引用局部数组）
+static CGFloat const kDash[2] = {4.0, 5.0};
+
 // kind: 0=全选 1=复制 2=粘贴
 static UIImage *KbDashedIcon(NSInteger kind) {
     const CGFloat side = 28.0;
@@ -20,13 +27,12 @@ static UIImage *KbDashedIcon(NSInteger kind) {
 
     UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         [[UIColor blackColor] setStroke];
-        CGFloat dash[2] = {4.0, 5.0};
 
         void (^prep)(UIBezierPath *) = ^(UIBezierPath *p) {
             p.lineWidth = 1.3;
             p.lineCapStyle = kCGLineCapRound;
             p.lineJoinStyle = kCGLineJoinRound;
-            [p setLineDash:dash count:2 phase:0];
+            [p setLineDash:kDash count:2 phase:0];
         };
 
         if (kind == 0) {
