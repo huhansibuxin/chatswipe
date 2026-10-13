@@ -176,7 +176,7 @@ static void chatswipe_paste(UIView *view) {
 // =====================================================================
 //  B. KbDock —— 键盘底部快捷条（全选 / 复制 / 粘贴）
 //  基于 MyDock(com.ban.mydock) 作者 1.0 源码改造：
-//   ① 删除「撤销」「收起键盘」 ② 新增「复制」 ③ 自绘虚线图标（无 SF Symbols）
+//   ① 删除「撤销」「收起键盘」 ② 新增「复制」 ③ 自绘「点状」图标（每图标 2 个极小点，靠摆放方向区分）
 //   ④ tintColor=labelColor → 自适应系统深浅色
 //  Hook: UIKeyboardDockView -layoutSubviews
 // =====================================================================
@@ -188,44 +188,39 @@ static void chatswipe_paste(UIView *view) {
 - (void)kb_paste;
 @end
 
-// ---- 自绘虚线图标 ----
-// 虚线参数（文件作用域，block 内不能引用局部数组）
-static CGFloat const kDash[2] = {1.0, 11.0};  // 档2·点状：极短划 + 大间隔 → 稀疏、淡
+// ---- 自绘点状图标 ----
+// 三个图标都只用 2 个点，靠「摆放方向」区分；点径 ≈ 上一版虚线的一个点（1.5pt）
+// 画布 26x26，两点居中对称摆放
+static CGFloat const kDotD   = 1.5;   // 点直径（极小）
+static CGFloat const kDotGap = 5.5;   // 两点中心间距
 
-// kind: 0=全选 1=复制 2=粘贴   （画布 26x26）
-static UIImage *KbDashedIcon(NSInteger kind) {
+// kind: 0=全选(上下)  1=复制(左上+右下)  2=粘贴(右上+左下)
+static UIImage *KbDotsIcon(NSInteger kind) {
     const CGFloat side = 26.0;
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
     UIGraphicsImageRenderer *renderer =
         [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:fmt];
 
     UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [[UIColor blackColor] setStroke];
+        [[UIColor blackColor] setFill];
 
-        void (^prep)(UIBezierPath *) = ^(UIBezierPath *p) {
-            p.lineWidth = 1.2;
-            p.lineCapStyle = kCGLineCapRound;
-            p.lineJoinStyle = kCGLineJoinRound;
-            [p setLineDash:kDash count:2 phase:0];
-        };
-
-        if (kind == 0) {
-            // 全选：与「粘贴」同款的竖圆角矩形虚线框
-            UIBezierPath *p = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(7.0, 5.0, 12.0, 17.0) cornerRadius:3.0];
-            prep(p); [p stroke];
-        } else if (kind == 1) {
-            // 复制：前后两层虚线框，两层靠拢
-            UIBezierPath *back  = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2.0, 2.0, 14.0, 14.0) cornerRadius:3.5];
-            UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(8.0, 7.0, 14.0, 14.0) cornerRadius:3.5];
-            prep(back);  [back stroke];
-            prep(front); [front stroke];
-        } else {
-            // 粘贴：虚线剪贴板（板 + 顶部小夹）
-            UIBezierPath *board = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(7.0, 5.0, 12.0, 17.0) cornerRadius:3.0];
-            UIBezierPath *tab   = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(9.5, 2.0, 7.0, 4.5) cornerRadius:1.5];
-            prep(board); [board stroke];
-            prep(tab);   [tab stroke];
+        CGFloat c = side / 2.0;
+        CGFloat h = kDotGap / 2.0;
+        CGPoint p1, p2;
+        if (kind == 0) {          // 全选：上 + 下
+            p1 = CGPointMake(c, c - h);         p2 = CGPointMake(c, c + h);
+        } else if (kind == 1) {   // 复制：左上 + 右下
+            p1 = CGPointMake(c - h, c - h);     p2 = CGPointMake(c + h, c + h);
+        } else {                  // 粘贴：右上 + 左下
+            p1 = CGPointMake(c + h, c - h);     p2 = CGPointMake(c - h, c + h);
         }
+
+        UIBezierPath *dot1 = [UIBezierPath bezierPathWithOvalInRect:
+            CGRectMake(p1.x - kDotD / 2.0, p1.y - kDotD / 2.0, kDotD, kDotD)];
+        UIBezierPath *dot2 = [UIBezierPath bezierPathWithOvalInRect:
+            CGRectMake(p2.x - kDotD / 2.0, p2.y - kDotD / 2.0, kDotD, kDotD)];
+        [dot1 fill];
+        [dot2 fill];
     }];
 
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
@@ -237,8 +232,8 @@ static UIButton *KbMakeButton(UIImage *icon, id target, SEL action) {
     [b setImage:icon forState:UIControlStateNormal];
     b.tintColor = [UIColor labelColor];
     b.translatesAutoresizingMaskIntoConstraints = NO;
-    [b.widthAnchor  constraintEqualToConstant:32].active = YES;
-    [b.heightAnchor constraintEqualToConstant:32].active = YES;
+    [b.widthAnchor  constraintEqualToConstant:44].active = YES;  // 热区 44x44（点再小也点得准）
+    [b.heightAnchor constraintEqualToConstant:44].active = YES;
     [b addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -257,9 +252,9 @@ static UIButton *KbMakeButton(UIImage *icon, id target, SEL action) {
     stackView.alignment = UIStackViewAlignmentCenter;
     stackView.translatesAutoresizingMaskIntoConstraints = NO;
 
-    [stackView addArrangedSubview:KbMakeButton(KbDashedIcon(0), self, @selector(kb_selectAll))];
-    [stackView addArrangedSubview:KbMakeButton(KbDashedIcon(1), self, @selector(kb_copy))];
-    [stackView addArrangedSubview:KbMakeButton(KbDashedIcon(2), self, @selector(kb_paste))];
+    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(0), self, @selector(kb_selectAll))];
+    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(1), self, @selector(kb_copy))];
+    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(2), self, @selector(kb_paste))];
 
     [self addSubview:stackView];
 
