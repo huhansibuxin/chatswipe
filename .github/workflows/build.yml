@@ -11,9 +11,8 @@ jobs:
       - name: Checkout
         run: |
           # 手动 git clone，绕过 actions/checkout 在 GitHub 限流(codeload 429/502/503)时下载失败的问题
-          # 用内置 GITHUB_TOKEN 克隆 → 私有仓库也能跑，无需转 public；--branch 跟随当前分支
-          git clone --depth 1 --branch "${{ github.ref_name }}" \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/huhansibuxin/chatswipe.git" .
+          # 编译期间需将仓库临时转为 public；--branch 跟随当前分支
+          git clone --depth 1 --branch "${{ github.ref_name }}" https://github.com/huhansibuxin/chatswipe.git .
 
       - name: Setup Theos
         run: |
