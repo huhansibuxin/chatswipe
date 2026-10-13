@@ -190,7 +190,7 @@ static void chatswipe_paste(UIView *view) {
 
 // ---- 自绘虚线图标 ----
 // 虚线参数（文件作用域，block 内不能引用局部数组）
-static CGFloat const kDash[2] = {2.0, 7.0};   // 短划 + 大间隔 → 稀疏、淡
+static CGFloat const kDash[2] = {1.0, 11.0};  // 档2·点状：极短划 + 大间隔 → 稀疏、淡
 
 // kind: 0=全选 1=复制 2=粘贴   （画布 26x26）
 static UIImage *KbDashedIcon(NSInteger kind) {
@@ -203,7 +203,7 @@ static UIImage *KbDashedIcon(NSInteger kind) {
         [[UIColor blackColor] setStroke];
 
         void (^prep)(UIBezierPath *) = ^(UIBezierPath *p) {
-            p.lineWidth = 1.0;
+            p.lineWidth = 1.2;
             p.lineCapStyle = kCGLineCapRound;
             p.lineJoinStyle = kCGLineJoinRound;
             [p setLineDash:kDash count:2 phase:0];
