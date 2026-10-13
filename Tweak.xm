@@ -252,9 +252,11 @@ static UIButton *KbMakeButton(UIImage *icon, id target, SEL action) {
     stackView.alignment = UIStackViewAlignmentCenter;
     stackView.translatesAutoresizingMaskIntoConstraints = NO;
 
-    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(0), self, @selector(kb_selectAll))];
-    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(1), self, @selector(kb_copy))];
-    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(2), self, @selector(kb_paste))];
+    // 按钮位置/功能不变（左→右 = 全选 / 复制 / 粘贴）；只调「点」的摆放：
+    //   全选 = 左低右高(2) · 复制 = 一上一下(0) · 粘贴 = 左高右低(1) → 视觉呈 / | \ 对称
+    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(2), self, @selector(kb_selectAll))]; // 左低右高
+    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(0), self, @selector(kb_copy))];      // 一上一下
+    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(1), self, @selector(kb_paste))];     // 左高右低
 
     [self addSubview:stackView];
 
