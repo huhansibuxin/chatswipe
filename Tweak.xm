@@ -22,6 +22,9 @@ static CGFloat const kDotGap = 5.5;   // 两点中心间距
 
 // kind: 0=一上一下  1=左高右低(左上+右下)  2=左低右高(右上+左下)
 static UIImage *KbDotsIcon(NSInteger kind) {
+    static UIImage *cache[3] = {nil, nil, nil};   // 性能：三种图标各只渲染一次，键盘复用时不再重绘
+    if (kind >= 0 && kind < 3 && cache[kind]) return cache[kind];
+
     const CGFloat side = 26.0;
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
     UIGraphicsImageRenderer *renderer =
@@ -49,7 +52,9 @@ static UIImage *KbDotsIcon(NSInteger kind) {
         [dot2 fill];
     }];
 
-    return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    UIImage *out = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    if (kind >= 0 && kind < 3) cache[kind] = out;   // 存入缓存
+    return out;
 }
 
 // ---- 按钮 ----
@@ -95,9 +100,13 @@ static UIButton *KbMakeButton(UIImage *icon, id target, SEL action) {
 
 %new
 - (void)kb_haptic {
-    UIImpactFeedbackGenerator *g =
-        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [g prepare];
+    // 性能：复用同一个触感发生器，避免每次点击都新建 + prepare 的开销
+    static UIImpactFeedbackGenerator *g = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [g prepare];
+    });
     [g impactOccurred];
 }
 
