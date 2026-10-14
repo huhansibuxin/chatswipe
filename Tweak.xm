@@ -1,6 +1,6 @@
 // ChatSwipe + KbDock — 合并版（两个功能同装一个插件）
 //   A. ChatSwipe 原功能：聊天输入框左滑清空 / 右滑粘贴 + 编辑菜单精简（只留 全选/复制/粘贴）
-//   B. KbDock     新功能：键盘底部快捷条（全选 / 复制 / 粘贴），自绘虚线图标，自适应深浅色
+//   B. KbDock     新功能：键盘底部快捷条（全选 / 复制 / 粘贴），自绘单点图标，自适应深浅色
 // 交付：单 dylib，经 TrollFools 注入目标进程。
 
 #import <UIKit/UIKit.h>
@@ -176,7 +176,7 @@ static void chatswipe_paste(UIView *view) {
 // =====================================================================
 //  B. KbDock —— 键盘底部快捷条（全选 / 复制 / 粘贴）
 //  基于 MyDock(com.ban.mydock) 作者 1.0 源码改造：
-//   ① 删除「撤销」「收起键盘」 ② 新增「复制」 ③ 自绘「点状」图标（每图标 2 个极小点，靠摆放方向区分）
+//   ① 删除「撤销」「收起键盘」 ② 新增「复制」 ③ 自绘「点状」图标（三个按钮统一为单个极小点）
 //   ④ tintColor=labelColor → 自适应系统深浅色
 //  Hook: UIKeyboardDockView -layoutSubviews
 // =====================================================================
@@ -189,15 +189,13 @@ static void chatswipe_paste(UIView *view) {
 @end
 
 // ---- 自绘点状图标 ----
-// 三个图标都只用 2 个点，靠「摆放方向」区分；点径 ≈ 上一版虚线的一个点（1.5pt）
-// 画布 26x26，两点居中对称摆放
-static CGFloat const kDotD   = 1.5;   // 点直径（极小）
-static CGFloat const kDotGap = 5.5;   // 两点中心间距
+// 三个按钮统一为「单个居中极小点」（原先双点靠摆放方向区分，已取消）
+// 画布 26x26，点径 ≈ 上一版虚线的一个点（1.5pt）
+static CGFloat const kDotD = 1.5;   // 点直径（极小）
 
-// kind: 0=一上一下  1=左高右低(左上+右下)  2=左低右高(右上+左下)
-static UIImage *KbDotsIcon(NSInteger kind) {
-    static UIImage *cache[3] = {nil, nil, nil};   // 性能：三种图标各只渲染一次，键盘复用时不再重绘
-    if (kind >= 0 && kind < 3 && cache[kind]) return cache[kind];
+static UIImage *KbDotIcon(void) {
+    static UIImage *cache = nil;   // 性能：只渲染一次，键盘复用时不再重绘
+    if (cache) return cache;
 
     const CGFloat side = 26.0;
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
@@ -208,27 +206,13 @@ static UIImage *KbDotsIcon(NSInteger kind) {
         [[UIColor blackColor] setFill];
 
         CGFloat c = side / 2.0;
-        CGFloat h = kDotGap / 2.0;
-        CGPoint p1, p2;
-        if (kind == 0) {          // 全选：上 + 下
-            p1 = CGPointMake(c, c - h);         p2 = CGPointMake(c, c + h);
-        } else if (kind == 1) {   // 复制：左上 + 右下
-            p1 = CGPointMake(c - h, c - h);     p2 = CGPointMake(c + h, c + h);
-        } else {                  // 粘贴：右上 + 左下
-            p1 = CGPointMake(c + h, c - h);     p2 = CGPointMake(c - h, c + h);
-        }
-
-        UIBezierPath *dot1 = [UIBezierPath bezierPathWithOvalInRect:
-            CGRectMake(p1.x - kDotD / 2.0, p1.y - kDotD / 2.0, kDotD, kDotD)];
-        UIBezierPath *dot2 = [UIBezierPath bezierPathWithOvalInRect:
-            CGRectMake(p2.x - kDotD / 2.0, p2.y - kDotD / 2.0, kDotD, kDotD)];
-        [dot1 fill];
-        [dot2 fill];
+        UIBezierPath *dot = [UIBezierPath bezierPathWithOvalInRect:
+            CGRectMake(c - kDotD / 2.0, c - kDotD / 2.0, kDotD, kDotD)];
+        [dot fill];
     }];
 
-    UIImage *out = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    if (kind >= 0 && kind < 3) cache[kind] = out;   // 存入缓存
-    return out;
+    cache = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];   // 存入缓存
+    return cache;
 }
 
 // ---- 按钮 ----
@@ -257,11 +241,10 @@ static UIButton *KbMakeButton(UIImage *icon, id target, SEL action) {
     stackView.alignment = UIStackViewAlignmentCenter;
     stackView.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // 按钮位置/功能不变（左→右 = 全选 / 复制 / 粘贴）；只调「点」的摆放：
-    //   全选 = 左低右高(2) · 复制 = 一上一下(0) · 粘贴 = 左高右低(1) → 视觉呈 / | \ 对称
-    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(2), self, @selector(kb_selectAll))]; // 左低右高
-    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(0), self, @selector(kb_copy))];      // 一上一下
-    [stackView addArrangedSubview:KbMakeButton(KbDotsIcon(1), self, @selector(kb_paste))];     // 左高右低
+    // 按钮位置/功能不变（左→右 = 全选 / 复制 / 粘贴）；三个图标统一为单个点
+    [stackView addArrangedSubview:KbMakeButton(KbDotIcon(), self, @selector(kb_selectAll))];
+    [stackView addArrangedSubview:KbMakeButton(KbDotIcon(), self, @selector(kb_copy))];
+    [stackView addArrangedSubview:KbMakeButton(KbDotIcon(), self, @selector(kb_paste))];
 
     [self addSubview:stackView];
 
